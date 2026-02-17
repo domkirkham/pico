@@ -9,7 +9,6 @@ from matplotlib import rc
 from scipy.stats import pearsonr, spearmanr, mannwhitneyu, fisher_exact
 
 
-from sklearn.preprocessing import StandardScaler
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import (
     roc_curve,
@@ -82,26 +81,31 @@ plt.rcParams["mathtext.it"] = "Source Sans 3:italic"
 
 
 def ensg_column_renamer(name):
+    """Strip version suffix from ENSEMBL IDs (e.g., ENSG... .1 -> ENSG...)."""
     return name.split(".")[0]
 
 
 def scanb_row_renamer(name):
+    """Strip version suffix from ScanB row identifiers."""
     return name.split(".")[0]
 
 
 def tte_cutoff(x, event, t_sfx, e_sfx, k, timepoint):
+    """Filter time-to-event rows by excluding early censored samples."""
     return x[
         ~((x[f"{event}_{t_sfx}"] < (k * timepoint)) & (x[f"{event}_{e_sfx}"] == 0))
     ]
 
 
 def _to_list(x: Any) -> List[Any]:
+    """Wrap non-list input in a single-item list."""
     if not isinstance(x, list):
         return [x]
     return x
 
 
 def rep_renamer(x, constraints, prefix="z"):
+    """Rename latent dimension columns using constraint names when available."""
     if constraints is None:
         return x
     else:
@@ -114,11 +118,13 @@ def rep_renamer(x, constraints, prefix="z"):
 
 class SignificanceResult:
     def __init__(self, statistic, pvalue):
+        """Container for test statistic and p-value."""
         self.statistic = statistic
         self.pvalue = pvalue
 
 
 def cont_tab(x_rd, x_pcr, feat):
+    """Create a 2xN contingency table for a feature across two groups."""
     return pd.merge(
         x_rd[feat].value_counts(),
         x_pcr[feat].value_counts(),
@@ -129,6 +135,7 @@ def cont_tab(x_rd, x_pcr, feat):
 
 
 def fisher_auc(cont_tab, x, y, feat):
+    """Compute Fisher exact test and best-direction ROC AUC for a feature."""
     try:
         res = fisher_exact(cont_tab)
         auc = roc_auc_score(y, x[feat])
@@ -141,6 +148,7 @@ def fisher_auc(cont_tab, x, y, feat):
 
 
 def mwu_auc(x, y, x_rd, x_pcr, feat):
+    """Compute Mann-Whitney U test and best-direction ROC AUC for a feature."""
     res = mannwhitneyu(x_rd[feat], x_pcr[feat])
     auc = roc_auc_score(y, x[feat])
     auc_neg = roc_auc_score(y, -1 * x[feat])
@@ -150,10 +158,12 @@ def mwu_auc(x, y, x_rd, x_pcr, feat):
 
 class DropCollinear(BaseEstimator, TransformerMixin):
     def __init__(self, thresh):
+        """Drop columns in X that are highly correlated beyond thresh."""
         self.uncorr_columns = None
         self.thresh = thresh
 
     def fit(self, X, y):
+        """Identify columns to keep based on correlation threshold and response."""
         cols_to_drop = []
 
         # Find variables to remove
@@ -186,144 +196,12 @@ class DropCollinear(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X):
+        """Return X with highly correlated columns removed."""
         return X[self.uncorr_columns]
 
     def get_params(self, deep=False):
+        """Return estimator parameters for sklearn compatibility."""
         return {"thresh": self.thresh}
-
-
-def k_fold_cross_validation(
-    fitters,
-    df,
-    duration_col,
-    event_col=None,
-    k=5,
-    scoring_method="log_likelihood",
-    fitter_kwargs={},
-    seed=None,
-):  # pylint: disable=dangerous-default-value,too-many-arguments,too-many-locals
-    """
-    Perform cross validation on a dataset. If multiple models are provided,
-    all models will train on each of the k subsets. Altered version of lifelines function, changed to return coeffs
-
-    Parameters
-    ----------
-    fitters: model
-      one or several objects which possess a method: ``fit(self, data, duration_col, event_col)``
-      Note that the last two arguments will be given as keyword arguments,
-      and that event_col is optional. The objects must also have
-      the "predictor" method defined below.
-    df: DataFrame
-      a Pandas DataFrame with necessary columns `duration_col` and (optional) `event_col`, plus
-      other covariates. `duration_col` refers to the lifetimes of the subjects. `event_col`
-      refers to whether the 'death' events was observed: 1 if observed, 0 else (censored).
-    duration_col: string
-        the name of the column in DataFrame that contains the subjects'
-        lifetimes.
-    event_col: string, optional
-        the  name of the column in DataFrame that contains the subjects' death
-        observation. If left as None, assume all individuals are uncensored.
-    k: int
-      the number of folds to perform. n/k data will be withheld for testing on.
-    scoring_method: str
-        one of {'log_likelihood', 'concordance_index'}
-        log_likelihood: returns the average unpenalized partial log-likelihood.
-        concordance_index: returns the concordance-index
-    fitter_kwargs:
-      keyword args to pass into fitter.fit method.
-    seed: fix a seed in np.random.seed
-
-    Returns
-    -------
-    results: list
-      (k,1) list of scores for each fold. The scores can be anything.
-
-    See Also
-    ---------
-    lifelines.utils.sklearn_adapter.sklearn_adapter
-
-    """
-    # Make sure fitters is a list
-    fitters = _to_list(fitters)
-
-    # Each fitter has its own scores
-    fitter_scores_ll = [[] for _ in fitters]
-
-    # Each fitter has its own scores
-    fitter_scores_c = [[] for _ in fitters]
-
-    # Each fitter has its own summaries
-    fitter_summs = [[] for _ in fitters]
-
-    # Each fitter has its own assumptions check
-    # fitter_assumps = [[] for _ in fitters]
-
-    n, _ = df.shape
-    df = df.copy()
-
-    if seed is not None:
-        np.random.seed(seed)
-
-    if event_col is None:
-        event_col = "E"
-        df[event_col] = 1.0
-
-    df = df.reindex(np.random.permutation(df.index)).sort_values(event_col)
-
-    assignments = np.array((n // k + 1) * list(range(1, k + 1)))
-    assignments = assignments[:n]
-
-    # testing_columns = df.columns.drop([duration_col, event_col])
-
-    for i in range(1, k + 1):
-        ix = assignments == i
-        training_data = df.loc[~ix]
-        testing_data = df.loc[ix]
-
-        z_columns = training_data.columns[
-            training_data.columns.str.startswith("z_")
-        ].tolist()
-        # Also want to standardise other continous variables
-        cont_columns = training_data.columns[
-            training_data.columns.isin(["Age", "Size.mm"])
-        ].tolist()
-        z_columns.extend(cont_columns)
-
-        if len(z_columns) > 0:
-            training_data_z = training_data.loc[:, z_columns]
-            testing_data_z = testing_data.loc[:, z_columns]
-
-            # standardise train and test data, only z columns
-            scaler = StandardScaler().fit(training_data_z)
-            training_data_z = scaler.transform(training_data_z)
-            testing_data_z = scaler.transform(testing_data_z)
-
-            training_data.loc[:, z_columns] = training_data_z
-            testing_data.loc[:, z_columns] = testing_data_z
-
-        for fitter, scores_ll, scores_c, summs in zip(
-            fitters, fitter_scores_ll, fitter_scores_c, fitter_summs
-        ):
-            # fit the fitter to the training data
-            fitter.fit(
-                training_data,
-                duration_col=duration_col,
-                event_col=event_col,
-                **fitter_kwargs,
-            )
-            scores_ll.append(
-                fitter.score(testing_data, scoring_method="log_likelihood")
-            )
-            scores_c.append(
-                fitter.score(testing_data, scoring_method="concordance_index")
-            )
-            summs.append(fitter.summary)
-            # fitter.check_assumptions(training_data, p_value_threshold=0.05)
-
-    # If a single fitter was given as argument, return a single result
-    if len(fitters) == 1:
-        return fitter_scores_ll[0], fitter_scores_c[0], fitter_summs[0]
-    return fitter_scores_ll, fitter_scores_c, fitter_summs
 
 
 class PerfComp:
@@ -331,6 +209,7 @@ class PerfComp:
 
     # Use cache to avoid loading all results every time
     def __init__(self, targets, experiment, wd_path, dataset="depmap_gdsc"):
+        """Initialize with targets, dataset name, and working directory."""
         self.targets = targets
         self.wd_path = wd_path
         self.experiment = experiment
@@ -361,25 +240,26 @@ class PerfComp:
         dataset,
         experiment,
         seeds,
-        # plot_iqr=False,
-        plot_scatter=False,
         return_z=False,
         return_val_z=False,
-        # merge_muts=None,
+        merge_muts=None,
         perm_imp=False,
         ld=False,
         cv_num=5,
     ):
+        """Load prediction files and compute metrics for one target/model/FE."""
         # Loads a single prediction file and calculates metrics, returning a dictionary
         pred_dict_list = []
-        # pred_dict_list_val = []
-        # weights_df_list = []
+        pred_dict_list_val = []
+        weights_df_list = []
         perm_imp_list = []
         for i, seed in enumerate(seeds):
-            if fe == "nn":
-                curr_folder = f"{self.wd_path}/data/outputs/{dataset}/{target.upper()}/{experiment}/nn"
-            else:
+            if fe in ["icovae", "vae"]:
                 curr_folder = f"{self.wd_path}/data/outputs/{dataset}/{target.upper()}/{experiment}/pico/{model}_{fe}"
+            elif fe == "pca":
+                curr_folder = f"{self.wd_path}/data/outputs/{dataset}/{target.upper()}/{experiment}/{model}_pca"
+            elif fe == "none":
+                curr_folder = f"{self.wd_path}/data/outputs/{dataset}/{target.upper()}/{experiment}/{model}"
 
             if ld:
                 curr_folder = f"{curr_folder}_ld"
@@ -393,7 +273,7 @@ class PerfComp:
             #     )
 
             # LOAD ARGUMENTS
-            if fe == "nn":
+            if model == "nn":
                 with open(f"{curr_folder}/args_best.txt", "r") as f:
                     args = json.load(f)
             else:
@@ -401,12 +281,12 @@ class PerfComp:
                     args = json.load(f)
 
             # Load constraints and feature extractor args if applicable
-            if fe != "nn":
+            if model != "nn":
                 constraints = args["constraints"]
                 n_genes = len(constraints)
 
             # Load predictions - test
-            if fe == "nn":
+            if model == "nn":
                 test_z = pd.read_csv(f"{curr_folder}/pred_test_s{seed}.csv")
             else:
                 test_z = pd.read_csv(f"{curr_folder}/z_pred_test_s{seed}.csv")
@@ -415,17 +295,21 @@ class PerfComp:
             test_gt = test_z["y"].to_numpy()
 
             # Load predictions - val for anything not NN
-            if fe != "nn":
-                val_zs = []
-                for i in range(cv_num):
-                    # if fe == "nn":
-                    #     val_z = pd.read_csv(f"{curr_folder}/pred_val_{i}_best_s{seed}.csv").set_index("ind")
-                    # else:
+            val_zs = []
+            for i in range(cv_num):
+                # if fe == "nn":
+                #     val_z = pd.read_csv(f"{curr_folder}/pred_val_{i}_best_s{seed}.csv").set_index("ind")
+                # else:
+                if model == "nn":
+                    # Val z is not saved for nn -- load val results below
+                    pass
+                else:
                     val_z = pd.read_csv(
-                        f"{curr_folder}/z_pred_val_{i}_best_s{seed}.csv"
+                        f"{curr_folder}/z_pred_val_{i}_best_s4563.csv"
                     ).set_index("ind")
                     val_zs.append(val_z)
 
+            if model != "nn":
                 val_z = pd.concat(val_zs, axis=0).reset_index()
 
                 val_pred = val_z["pred_0"].to_numpy()
@@ -479,13 +363,32 @@ class PerfComp:
             spearman_r = spearmanr(test_pred[~nas], test_gt[~nas])[0]
 
             # METRICS FOR VAL DATA
-            if fe != "nn":
+            if model != "nn":
                 nas_val = np.logical_or(np.isnan(val_pred), np.isnan(val_gt))
                 rmse_val = np.sqrt(
                     np.mean(np.square(val_pred[~nas_val] - val_gt[~nas_val]))
                 )
                 pearson_r_val = pearsonr(val_pred[~nas_val], val_gt[~nas_val])[0]
                 spearman_r_val = spearmanr(val_pred[~nas_val], val_gt[~nas_val])[0]
+            else:
+                best_trial = (
+                    pd.read_csv(f"{curr_folder}/opt_study_results_s4563.csv")
+                    .sort_values(by="value", ascending=True)
+                    .iloc[0]["number"]
+                )
+                val_results = pd.read_csv(
+                    f"{curr_folder}/cv_results_{best_trial}.csv", header=0
+                )
+                val_results.columns = ["variable", "value"]
+                rmse_val = val_results[val_results["variable"] == "val_rmse"][
+                    "value"
+                ].mean()
+                pearson_r_val = val_results[val_results["variable"] == "val_pearsonr"][
+                    "value"
+                ].mean()
+                spearman_r_val = val_results[
+                    val_results["variable"] == "val_spearmanr"
+                ]["value"].mean()
 
             # test_metrics = pd.read_csv(f"{curr_folder}/test_metrics.csv", header=0)
 
@@ -557,55 +460,23 @@ class PerfComp:
                 else:
                     pi_df = pd.concat([pi_df, pd.DataFrame(perm_imp_list)], axis=0)
 
-            if plot_scatter:
-                pal = sns.color_palette("Set2")
-                if fe == "icovae":
-                    c = pal[1]
-                elif fe == "vae":
-                    c = pal[0]
-                elif fe == "nn":
-                    c = pal[2]
-                f, ax = plt.subplots(1, 1, figsize=(3, 3))
-                sns.regplot(x=test_pred, y=test_gt, color=c)
-                ax.set_xlabel(f"{target.capitalize()} pred. ln(IC50)")
-                ax.set_ylabel(f"{target.capitalize()} ln(IC50)")
-                sns.despine(ax=ax)
-                ax.text(
-                    s=rf"$r_p={pearson_r:.3f}$", x=0.1, y=0.8, transform=ax.transAxes
-                )
-            if fe == "nn":
-                pred_dict_list.append(
-                    {
-                        "target": target,
-                        "model": model,
-                        "fe": fe,
-                        "zdim": np.nan,
-                        "n_genes": np.nan,
-                        "rmse": rmse,
-                        "pearson_r": pearson_r,
-                        "spearman_r": spearman_r,
-                        "rmse_val": np.nan,
-                        "pearson_r_val": np.nan,
-                        "spearman_r_val": np.nan,
-                        "seed": seed,
-                    }
-                )
-            else:
-                pred_dict_list.append(
-                    {
-                        "target": target,
-                        "model": model,
-                        "fe": fe,
-                        "n_genes": n_genes,
-                        "rmse": rmse,
-                        "pearson_r": pearson_r,
-                        "spearman_r": spearman_r,
-                        "rmse_val": rmse_val,
-                        "pearson_r_val": pearson_r_val,
-                        "spearman_r_val": spearman_r_val,
-                        "seed": seed,
-                    }
-                )
+            pred_dict_list.append(
+                {
+                    "target": target,
+                    "model": model,
+                    "fe": fe,
+                    "rmse": rmse,
+                    "pearson_r": pearson_r,
+                    "spearman_r": spearman_r,
+                    "rmse_val": rmse_val,
+                    "pearson_r_val": pearson_r_val,
+                    "spearman_r_val": spearman_r_val,
+                    "seed": seed,
+                }
+            )
+
+        if perm_imp and fe.split("_")[0] == "icovae":
+            pass
 
         if return_z:
             if perm_imp:
@@ -633,38 +504,43 @@ class PerfComp:
         ld=False,
         cv_num=5,
     ):
+        """Load prediction files and compute metrics stratified by lineage/type."""
         # Loads a single prediction file and calculates metrics, returning a dictionary
 
         palette = sns.color_palette("colorblind")
 
         pred_dict_list = []
-        # weights_df_list = []
+        weights_df_list = []
 
         for i, seed in enumerate(seeds):
-            if fe == "nn":
-                curr_folder = f"{self.wd_path}/data/outputs/{dataset_name}/{target.upper()}/{experiment}/nn"
-            else:
+            if fe in ["icovae", "vae"]:
                 curr_folder = f"{self.wd_path}/data/outputs/{dataset_name}/{target.upper()}/{experiment}/pico/{model}_{fe}"
-
+            elif fe == "pca":
+                curr_folder = f"{self.wd_path}/data/outputs/{dataset_name}/{target.upper()}/{experiment}/{model}_pca"
+            elif fe == "none":
+                curr_folder = f"{self.wd_path}/data/outputs/{dataset_name}/{target.upper()}/{experiment}/{model}"
             if ld:
                 curr_folder = f"{curr_folder}_ld"
 
             # Load constraints and feature extractor args if applicable, on first seed
-            if i == 0:
+            if model == "nn":
                 # LOAD ARGUMENTS
                 with open(f"{curr_folder}/args_best.txt", "r") as f:
                     args = json.load(f)
+            else:
+                with open(f"{curr_folder}/args_best_s{seed}.txt", "r") as f:
+                    args = json.load(f)
 
-                x, s, c, y, test_samples = process_data(
-                    dataset=dataset_name, wd_path=self.wd_path, experiment=experiment
-                )
-                if fe != "nn":
-                    constraints = args["constraints"]
-                else:
-                    constraints = [s.columns[0]]
-                genes = [constraint.strip() for constraint in constraints]
-                n_genes = len(constraints)
+            x, s, c, y, test_samples = process_data(
+                dataset=dataset_name, wd_path=self.wd_path, experiment=experiment
+            )
 
+            constraints = args["constraints"]
+
+            genes = [constraint.strip() for constraint in constraints]
+            n_genes = len(constraints)
+
+            if seed == 10:
                 dataset = Manual(
                     x=x,
                     s=s,
@@ -675,13 +551,13 @@ class PerfComp:
                 )
 
             # Load predictions
-            if fe == "nn":
+            if model == "nn":
                 test_z = pd.read_csv(f"{curr_folder}/pred_test_s{seed}.csv")
             else:
                 test_z = pd.read_csv(f"{curr_folder}/z_pred_test_s{seed}.csv")
 
-            # test_pred = test_z["pred_0"].to_numpy()
-            # test_gt = test_z["y"]
+            test_pred = test_z["pred_0"].to_numpy()
+            test_gt = test_z["y"]
 
             # Add typing information for plots
             test_z["ModelID"] = test_z["ind"].apply(lambda x: dataset.idx_to_sample[x])
@@ -697,21 +573,25 @@ class PerfComp:
             )
 
             # Load predictions - val for anything not NN
-            if fe != "nn":
-                val_zs = []
-                for i in range(cv_num):
-                    # if fe == "nn":
-                    #     val_z = pd.read_csv(f"{curr_folder}/pred_val_{i}_best_s{seed}.csv").set_index("ind")
-                    # else:
+            val_zs = []
+            for i in range(cv_num):
+                # if fe == "nn":
+                #     val_z = pd.read_csv(f"{curr_folder}/pred_val_{i}_best_s{seed}.csv").set_index("ind")
+                # else:
+                if model == "nn":
+                    # Val z is not saved for nn -- load val results below
+                    pass
+                else:
                     val_z = pd.read_csv(
-                        f"{curr_folder}/z_pred_val_{i}_best_s{seed}.csv"
+                        f"{curr_folder}/z_pred_val_{i}_best_s4563.csv"
                     ).set_index("ind")
                     val_zs.append(val_z)
 
+            if model != "nn":
                 val_z = pd.concat(val_zs, axis=0).reset_index()
 
-                # val_pred = val_z["pred_0"].to_numpy()
-                # val_gt = val_z["y"].to_numpy()
+                val_pred = val_z["pred_0"].to_numpy()
+                val_gt = val_z["y"].to_numpy()
 
                 # Add typing information for plots
                 val_z["ModelID"] = val_z["ind"].apply(
@@ -734,6 +614,7 @@ class PerfComp:
 
             plot_lins = []
             for lineage in lineages:
+                print(f"Calculating metrics for lineage {lineage}...")
                 test_z_type = test_z[test_z["OncotreeLineage"] == lineage]
                 test_pred_type = test_z_type["pred_0"].to_numpy()
                 test_gt_type = test_z_type["y"].to_numpy()
@@ -751,7 +632,7 @@ class PerfComp:
                 else:
                     continue
 
-                if fe == "nn":
+                if model == "nn":
                     pred_dict_list.append(
                         {
                             "target": target,
@@ -786,7 +667,7 @@ class PerfComp:
                         }
                     )
 
-            if fe != "nn":
+            if model != "nn":
                 for lineage in lineages_val:
                     val_z_type = val_z[val_z["OncotreeLineage"] == lineage]
                     val_pred_type = val_z_type["pred_0"].to_numpy()
@@ -805,7 +686,7 @@ class PerfComp:
                     else:
                         continue
 
-                    if fe == "nn":
+                    if model == "nn":
                         pass
                     else:
                         pred_dict_list.append(
@@ -827,7 +708,7 @@ class PerfComp:
 
             # Plot scatter plots for each type
             if plot and (seed == 10):
-                palette_lm = {"ccvae": palette[1], "vae": palette[0], "nn": palette[2]}
+                palette_lm = {"icovae": palette[1], "vae": palette[0], "nn": palette[2]}
                 g = sns.lmplot(
                     data=test_z[test_z["OncotreeLineage"].isin(plot_lins)],
                     row="OncotreeLineage",
@@ -868,6 +749,7 @@ class PerfComp:
 
     @staticmethod
     def _annotate(data, target, **kws):
+        """Annotate a scatterplot with Pearson r for the given target."""
         r, p = pearsonr(data["pred_0"], data[target.upper()])
         ax = plt.gca()
         ax.text(
@@ -882,10 +764,14 @@ class PerfComp:
     def calculate_perf(
         self, fes, models, plot_iqr=False, by_type=False, use_cache=True, wd_path=None
     ):
+        """Aggregate performance metrics across targets, FEs, and models."""
         perf_dict_list = []
         for target in self.targets:
             for fe in fes:
                 for model in models:
+                    # Skip incompatible combinations
+                    if (fe != "none") and (model == "nn"):
+                        continue
                     # If cache is present and we want to use it then don't load new data
                     if by_type:
                         if (self.perf_df_type is not None) and use_cache:
@@ -929,9 +815,9 @@ class PerfComp:
                                 self.dataset,
                                 self.experiment,
                                 self.seeds,
-                                plot_iqr=plot_iqr,
                             )
-                    except UserWarning(f"Missing: {target}, {fe}, {model}\n"):
+                    except:
+                        print(f"Missing: {target}, {fe}, {model}\n")
                         continue
                     perf_dict_list.extend(curr_perf_dict_list)
 
@@ -963,6 +849,7 @@ class PerfComp:
         return perf_df
 
     def plot_perf(self):
+        """Placeholder for performance plotting."""
         pass
 
     @staticmethod
@@ -1009,6 +896,7 @@ class PerfComp:
         ax.tick_params(left=False)
 
     def plot_coeffs(self, model, regressor, z_cols):
+        """Plot top regression coefficients for a model."""
         sns.set_palette("colorblind")
         sns.set_context("talk")
         sns.set_style("whitegrid")
@@ -1043,6 +931,7 @@ def calculate_feat_imps(
     nn=False,
     train=False,
 ):
+    """Compute permutation feature importances from saved prediction files."""
     # Loads a single prediction file and calculates metrics, returning a dictionary
     pred_dict_list = []
     perm_imp_list = []
@@ -1066,6 +955,10 @@ def calculate_feat_imps(
             constraints = args["constraints"]
             n_constraints = len(constraints)
             confounders = args["confounders"]
+            if confounders is None:
+                n_confounders = 0
+            else:
+                n_confounders = len(confounders)
 
         # Load predictions
         if train:
@@ -1156,6 +1049,12 @@ def calculate_feat_imps(
                 data = json.load(reg_model)
                 reg_weights = np.array(data["coeffs"][0])
                 reg_bias = np.array(data["intercept"])
+        elif reg == "RandomForestRegressor":
+            with open(f"{model_path}/regressor_s{seed}.txt") as reg_model:
+                data = json.load(reg_model)
+                # For tree-based models, feature importances are used instead of weights
+                reg_weights = np.array(data["feature_importances"])
+                reg_bias = 0.0  # No bias term for tree-based models
 
         test_z_rep_z = test_z.iloc[:, test_z.columns.str.startswith("z")]
         test_z_rep_c = test_z.iloc[:, test_z.columns.str.startswith("c")]
@@ -1267,7 +1166,7 @@ def calculate_feat_imps(
         return pred_dict_list, constraints, confounders, pi_df
 
 
-def plot_feat_imps_v2(
+def plot_feat_imps(
     pi_df,
     target,
     constraints,
@@ -1283,6 +1182,7 @@ def plot_feat_imps_v2(
     sort_feats=False,
     top_k=16,
 ):
+    """Plot permutation feature importances as a bar chart with error bars."""
     # PERMUTATION FEATURE IMPORTANCE
     from matplotlib.colors import rgb_to_hsv
 
@@ -1291,13 +1191,18 @@ def plot_feat_imps_v2(
     n_feats_plot = top_k if sort_feats else zdim
 
     pal = sns.color_palette("colorblind")
-    f, ax = plt.subplots(
-        2,
-        2,
-        figsize=(3, n_feats_plot / 5),
-        sharey=False,
-        gridspec_kw={"width_ratios": [6, 4], "height_ratios": [40, 1]},
-    )
+    if target not in ["RCB.score", "resp.pCR"]:
+        f, ax = plt.subplots(
+            1,
+            1,
+            figsize=(3, n_feats_plot / 6),
+        )
+    else:
+        f, ax = plt.subplots(
+            1,
+            1,
+            figsize=(3, n_feats_plot / 5),
+        )
     pi_df_plot = pi_df.copy()
     if metric in ["r", "s", "rmse"]:
         pi_df_plot["fi_r"] = (
@@ -1365,12 +1270,6 @@ def plot_feat_imps_v2(
 
     pi_df_plot = pi_df_plot.set_index("dim").loc[plot_order].reset_index()
 
-    print(
-        pi_df_plot.groupby(["dim"])
-        .mean()
-        .sort_values(f"fi_{metric}", ascending=(metric != "rmse"))
-    )
-
     if metric == "rmse":
         pal_cm = sns.diverging_palette(
             rgb_to_hsv(pal[1])[0] * 360,
@@ -1395,37 +1294,9 @@ def plot_feat_imps_v2(
         "rmse": r"$\Delta\%$ RMSE",
         "auroc": r"$\Delta$AUROC",
     }
+
+    text_shifts = {"r": 2.5, "s": 2.5, "rmse": -2.5, "auroc": 0.015}
     # sns.barplot(data=pi_df_plot, y="dim", x="fi_r", order=plot_order[:n_feats], estimator="mean", errorbar=("sd", 1), palette=pal)
-    sns.heatmap(
-        pi_df_plot_hm,
-        yticklabels=True,
-        square=False,
-        linewidths=1,
-        cmap=pal_cm,
-        center=0,
-        ax=ax[0, 0],
-        cbar_ax=ax[1, 0],
-        cbar_kws={
-            "orientation": "horizontal",
-            "fraction": 0.02,
-            "label": f"Permutation FI ({cbar_labels[metric]})",
-            "use_gridspec": False,
-        },
-    )
-    sns.despine(ax=ax[0, 0], bottom=True, left=True)
-    # ax.set_xlabel("Permutation feature importance")
-    ax[0, 0].set_ylabel("")
-    ax[0, 0].set_xlabel("")
-    # ax.set_yticks(plot_order[:n_feats], plot_order[:n_feats], rotation=0, fontsize=10)
-    # ax.axvline(0, color="grey", linestyle="--", alpha=0.5)
-    ax[0, 0].set_xticks([], [])
-    ax[0, 0].tick_params(axis="y", which="major", labelsize=12)
-    # ax[0,0].set_xlim(0.0, 10.25)
-    # if drug.startswith("AZD"):
-    #     ax[0,0].set_title(drug.upper(), fontweight="bold")
-    # else:
-    #     ax[0,0].set_title(drug.capitalize(), fontweight="bold")
-    ax[0, 0].set_title("")
 
     # BARPLOT
     sns.barplot(
@@ -1434,38 +1305,76 @@ def plot_feat_imps_v2(
         x=f"fi_{metric}",
         estimator="mean",
         errorbar=("sd", 1),
-        ax=ax[0, 1],
+        ax=ax,
         capsize=0.25,
         dodge=False,
         err_kws={"linewidth": 1, "alpha": 0.5},
     )
-    ax[0, 1].axvline(0, linestyle="--", color="grey", alpha=0.5)
-    ax[0, 1].set_ylim(len(plot_order) - 0.5, -0.5)
-    ax[0, 1].set_yticks([], [])
-    ax[0, 1].set_ylabel("")
-    ax[0, 1].set_xlabel("FI")
+    sns.stripplot(
+        data=pi_df_plot,
+        y="dim",
+        x=f"fi_{metric}",
+        color="black",
+        size=2,
+        alpha=0.5,
+        ax=ax,
+        jitter=True,
+    )
+    ax.axvline(0, linestyle="--", color="grey", alpha=0.5)
+    ax.set_ylim(len(plot_order) - 0.5, -0.5)
 
-    for i, bar in enumerate(ax[0, 1].patches):
+    y_tick_pos = [i for i in range(len(plot_order))]
+
+    ax.set_yticks([], [])
+
+    ax.set_ylabel("")
+    if metric == "r":
+        ax.set_xlabel("Feature importance\n" + r"($\%$ change $\rho_p$)")
+    elif metric == "s":
+        ax.set_xlabel("Feature importance\n" + r"($\%$ change $\rho_s$)")
+    elif metric == "rmse":
+        ax.set_xlabel("Feature importance\n" + r"($\%$ change RMSE)")
+    elif metric == "auroc":
+        ax.set_xlabel("Feature importance\n" + r"(change in AUROC)")
+    for i, bar in enumerate(ax.patches):
         if bar.get_height() > 0:
-            if (ax[0, 1].lines[i].get_xdata()[-1] > 0) and (
-                ax[0, 1].lines[i].get_xdata()[0] > 0
-            ):
+            if (ax.lines[i].get_xdata()[-1] > 0) and (ax.lines[i].get_xdata()[0] > 0):
                 bar.set_color(pal_cm(0.75))
-            elif (ax[0, 1].lines[i].get_xdata()[-1] < 0) and (
-                ax[0, 1].lines[i].get_xdata()[0] < 0
-            ):
+                color = pal_cm(1.0)
+            elif (ax.lines[i].get_xdata()[-1] < 0) and (ax.lines[i].get_xdata()[0] < 0):
                 bar.set_color(pal_cm(0.25))
+                color = pal_cm(0.0)
             else:
                 bar.set_color("lightgrey")
+                color = "grey"
+
+        if plot_order[i] == "$z_":
+            ax.text(
+                text_shifts[metric],
+                y_tick_pos[i],
+                plot_order[i],
+                horizontalalignment="right",
+                verticalalignment="center",
+                color=color,
+                fontsize=12,
+            )
+        else:
+            ax.text(
+                text_shifts[metric],
+                y_tick_pos[i],
+                plot_order[i],
+                horizontalalignment="right",
+                verticalalignment="center",
+                color=color,
+                fontsize=10,
+            )
 
     if metric != "rmse":
-        ax[0, 1].invert_xaxis()
+        ax.invert_xaxis()
 
     # y_tick_pos = [i+0.5 for i in range(len(plot_order))]
     # ax[0,1].yticks
-    sns.despine(ax=ax[0, 1], bottom=True, left=True)
-    sns.despine(ax=ax[1, 0], bottom=True, left=True)
-    ax[1, 1].axis("off")
+    sns.despine(ax=ax, bottom=True, left=True)
 
     plt.subplots_adjust(wspace=0.00, hspace=0.05)
 

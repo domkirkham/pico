@@ -1,0 +1,15 @@
+# Python / tooling
+__pycache__/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local data + outputs
+data/
+src/data/
+src/data/outputs/
+src/fonts/
+
+# Model artifacts
+*.pt
+*.pth
+*.ckpt

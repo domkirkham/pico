@@ -39,8 +39,8 @@ def submission_pico_sk_transneo(
         constraints_str = " ".join(constraints)
 
     submission_preamble = rf"""#!/bin/bash
-#SBATCH -J dk538-pico
-#SBATCH -A your-project-name
+#SBATCH -J dk538-ssvae
+#SBATCH -A MRC-BSU2-SL2-CPU
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time={walltime}
@@ -131,13 +131,13 @@ def submission_pico_sk_scanb(
 
     submission_preamble = rf"""#!/bin/bash
 #SBATCH -J dk538-ssvae
-#SBATCH -A your-project-name
+#SBATCH -A MRC-BSU2-SL2-CPU
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time={walltime}
 #SBATCH --mail-type=end
 #SBATCH --mail-user=dom.kirkham@mrc-bsu.cam.ac.uk
-#SBATCH --output=path_to_dir/%j.out
+#SBATCH --output=/home/dk538/rds/hpc-work/graphdep/slurm_out/pico_hopt/%j.out
 #SBATCH --no-requeue
 #SBATCH -p icelake-himem
 #SBATCH --mem=13500
@@ -183,7 +183,7 @@ fi
 
 eval $CMD"""
 
-    script_args = rf"""CMD="$application -reg {reg} -enc {enc} -target {target} -dataset {dataset} -seed {seed}"""
+    script_args = rf"""CMD="$application -reg {reg} -enc {enc} -target {target} -dataset {dataset} -seed {seed} --newstudy"""
     if reg == "CoxPH":
         script_args = rf"""{script_args} --duration-event MONTHS STATUS"""
     if constraints is not None:
@@ -211,6 +211,8 @@ eval $CMD"""
 
 
 def main(args):
+    if args.strata is None:
+        args.strata = [None]
     if args.dataset == "depmap_gdsc_transneo":
         feat_sets = [
             "Rep",
@@ -223,15 +225,15 @@ def main(args):
     elif args.dataset == "depmap_gdsc_scanb_tcga":
         feat_sets = ["Rep", "Clinical+Rep", "Clinical"]
     if args.target == "RCB.score":
-        regs = ["ElasticNet", "SVR"]
+        regs = ["ElasticNet", "SVR", "RandomForestRegressor"]
     elif args.target == "resp.pCR":
         regs = ["LogisticRegression"]
-    elif args.target == "BCFi_5Y":
+    elif args.target in ["BCFi_3Y", "OS_3Y", "BCFi_5Y"]:
         regs = ["LogisticRegression"]
-    elif args.target == "BCFi":
+    elif args.target == "BCFi_MONTHS":
         regs = ["CoxPH"]
-    encs = ["iCoVAE", "VAE"]
-    seeds = [60]
+    encs = ["VAE", "iCoVAE"]
+    seeds = [4563]
 
     for seed in seeds:
         for feat_set in feat_sets:
@@ -251,11 +253,10 @@ def main(args):
                     if feat_set in ["Clinical+RNA", "RNA", "Clinical"]:
                         job_path_root = f"{job_path_root}_norep"
                     job_path = f"{job_path_root}/test_metrics_s{seed}.csv"
-                    job_path_val = f"{job_path_root}/z_pred_val_0_best_s{seed}.csv"
 
                     if os.path.exists(job_path) and not args.newstudy:
                         print(f"Job previously completed: {job_path}")
-                    elif not os.path.exists(job_path_val):
+                    else:
                         if args.dataset == "depmap_gdsc_scanb_tcga":
                             script = submission_pico_sk_scanb(
                                 dataset=args.dataset,
@@ -292,8 +293,6 @@ def main(args):
                         print("Running: sbatch " + script_name)
                         os.system("sbatch " + script_name)
                         time.sleep(0.2)
-                    else:
-                        print(f"Job previously completed: {job_path}")
 
 
 # To cancel these jobs, run the below
@@ -340,7 +339,7 @@ def parser_args(parser):
     )
     parser.add_argument(
         "-walltime",
-        default="06:00:00",
+        default="12:00:00",
         type=str,
         help="Walltime per job",
     )

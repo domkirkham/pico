@@ -14,7 +14,6 @@ from sklearn.linear_model import ElasticNet, Lasso, LinearRegression, LogisticRe
 from sklearn.svm import SVR, SVC
 from sklearn.metrics import roc_curve, auc, precision_recall_curve, f1_score, log_loss
 
-from lifelines import CoxPHFitter
 
 from .objective import exp_log_likelihood, compute_kl
 
@@ -22,6 +21,39 @@ from .objective import exp_log_likelihood, compute_kl
 model_sizes = {"linear": [], "1": [512], "2": [512, 256], "3": [512, 256, 128]}
 
 cf_model_sizes = {"linear": [], "1": [512], "2": [512, 256], "3": [512, 256, 128]}
+
+
+def get_search_spaces(model_type: str) -> Dict[str, list]:
+    if (
+        (model_type == "ElasticNet")
+        or (model_type == "CoxPH")
+        or model_type == "LogisticRegression"
+    ):
+        search_spaces = {
+            "alpha": np.logspace(-4, 2, 30),
+            "l1_ratio": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        }
+    elif model_type == "SVR":
+        search_spaces = {
+            "eps": np.logspace(-3, 0, 15),
+            "c": np.logspace(-3, 3, 30),
+            "kernel": ["linear"],
+        }
+    elif model_type == "RandomForestRegressor":
+        search_spaces = {
+            "max_depth": [None, 8, 12, 16, 20],
+            "max_features": [0.5, 0.7],
+            "max_samples": [None, 0.8, 0.9],
+            "min_samples_leaf": [1, 4],
+            "min_samples_split": [2, 5, 10, 15],
+            "n_estimators": [200, 400, 600],
+        }
+    else:
+        raise ValueError(
+            "Model type not recognised. Please choose from ElasticNet, SVR, RandomForestRegressor, LogisticRegression"
+        )
+
+    return search_spaces
 
 
 def itr_merge(*itrs):
@@ -32,7 +64,25 @@ def itr_merge(*itrs):
 
 # MODEL COMPONENT CLASSES
 class TabularEncoder(nn.Module):
-    """Parameterises latent space"""
+    """
+    MLP encoder that parameterizes q(z|x) as a diagonal Gaussian.
+
+    Builds `n_layers` fully connected layers with optional LayerNorm and dropout.
+    Returns `(loc, scale)` where `scale` is softplus-transformed and clamped.
+
+    Args:
+        input_dim: Input feature dimension.
+        latent_dim: Latent dimensionality.
+        layer_width: Hidden layer width.
+        n_layers: Number of hidden layers.
+        activation: Activation name (`relu`, `leakyrelu`, or None).
+        ln: Whether to apply LayerNorm after each hidden layer.
+        dropout: Dropout probability.
+
+    Returns:
+        loc: Mean of q(z|x), shape [batch, latent_dim].
+        scale: Stddev of q(z|x), shape [batch, latent_dim].
+    """
 
     _modules: Dict[str, nn.Module]
 
@@ -40,22 +90,25 @@ class TabularEncoder(nn.Module):
         self,
         input_dim: int,
         latent_dim: int,
-        model_size: str,
-        activation: str = "relu",
+        layer_width: int,
+        n_layers: int,
+        activation: str = "leakyrelu",
         ln: bool = True,
         dropout: float = 0.0,
     ):
         super(TabularEncoder, self).__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
-        self.layer_widths = model_sizes[model_size]
+        self.layer_width = layer_width
+        self.n_layers = n_layers
+        self.layer_widths = [layer_width] * n_layers
         self.activation = activation
         self.ln = ln
         self.dropout = dropout
         self._modules = {}
 
         # Build the layers for the model architecture (without nn.Sequential)
-        for layer_num in range(len(self.layer_widths)):
+        for layer_num in range(n_layers):
             if layer_num == 0:
                 self._modules[f"f{layer_num}"] = nn.Linear(
                     input_dim, self.layer_widths[layer_num]
@@ -81,7 +134,7 @@ class TabularEncoder(nn.Module):
 
     def forward(self, x: torch.tensor) -> Tuple[torch.tensor, torch.tensor]:
         # Build layer order for forward pass, including BN, dropout, activations
-        for layer_num in range(len(self.layer_widths)):
+        for layer_num in range(self.n_layers):
             x = self._modules[f"f{layer_num}"](x)
             if self.ln:
                 x = self._modules[f"ln{layer_num}"](x)
@@ -89,7 +142,7 @@ class TabularEncoder(nn.Module):
                 x = F.relu(x)
             if self.activation == "leakyrelu":
                 x = F.leaky_relu(x)
-            elif self.activation is None:
+            elif self.activation == None:
                 pass
             if self.dropout > 0:
                 x = self._modules[f"d{layer_num}"](x)
@@ -99,7 +152,22 @@ class TabularEncoder(nn.Module):
 
 
 class TabularDecoder(nn.Module):
-    """Regenerates input from latent space sample"""
+    """
+    MLP decoder that reconstructs x from latent z.
+
+    Builds `n_layers` fully connected layers with optional LayerNorm and dropout.
+    When `calibrated=True`, learns a single global reconstruction scale.
+
+    Args:
+        input_dim: Output feature dimension.
+        latent_dim: Latent dimensionality.
+        activation: Activation name (`relu`, `leakyrelu`, `sigmoid`, or None).
+        layer_width: Hidden layer width.
+        n_layers: Number of hidden layers.
+        ln: Whether to apply LayerNorm after each hidden layer.
+        dropout: Dropout probability.
+        calibrated: Whether to learn a global reconstruction scale parameter.
+    """
 
     _modules: Dict[str, nn.Module]
 
@@ -107,8 +175,9 @@ class TabularDecoder(nn.Module):
         self,
         input_dim=1000,
         latent_dim=128,
-        activation="relu",
-        model_size="s",
+        activation="leakyrelu",
+        layer_width=256,
+        n_layers=2,
         ln=True,
         dropout=0,
         calibrated=True,
@@ -116,7 +185,9 @@ class TabularDecoder(nn.Module):
         super(TabularDecoder, self).__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
-        self.layer_widths = list(reversed(model_sizes[model_size]))
+        self.layer_width = layer_width
+        self.n_layers = n_layers
+        self.layer_widths = [layer_width] * n_layers
         self.activation = activation
         self.ln = ln
         self.calibrated = calibrated
@@ -129,7 +200,7 @@ class TabularDecoder(nn.Module):
         self._modules = {}
 
         # Build the layers for the model architecture (without nn.Sequential)
-        for layer_num in range(len(self.layer_widths)):
+        for layer_num in range(self.n_layers):
             if layer_num == 0:
                 self._modules[f"f{layer_num}"] = nn.Linear(
                     self.latent_dim, self.layer_widths[layer_num]
@@ -153,7 +224,7 @@ class TabularDecoder(nn.Module):
 
     def forward(self, z: torch.tensor) -> torch.tensor:
         # Build layer order for forward pass, including LN, dropout, activations
-        for layer_num in range(len(self.layer_widths)):
+        for layer_num in range(self.n_layers):
             z = self._modules[f"f{layer_num}"](z)
             if self.ln:
                 z = self._modules[f"ln{layer_num}"](z)
@@ -163,7 +234,7 @@ class TabularDecoder(nn.Module):
                 z = F.leaky_relu(z)
             elif self.activation == "sigmoid":
                 z = F.sigmoid(z)
-            elif self.activation is None:
+            elif self.activation == None:
                 pass
             if self.dropout > 0:
                 z = self._modules[f"d{layer_num}"](z)
@@ -174,6 +245,12 @@ class TabularDecoder(nn.Module):
 
 
 class Diagonal(nn.Module):
+    """
+    Learnable per-dimension affine transform: y = x * weight + bias.
+
+    Args:
+        dim: Number of dimensions.
+    """
     def __init__(self, dim):
         super(Diagonal, self).__init__()
         self.dim = dim
@@ -185,27 +262,56 @@ class Diagonal(nn.Module):
 
 
 class DiagonalRegressor(nn.Module):
+    """
+    Diagonal Gaussian regressor with learnable mean and variance.
+
+    The mean is modeled as a per-dimension affine transform. Variance can be:
+    - `constraint`: per-dimension variance
+    - `single`: one shared variance
+    - `fixed`: fixed variance buffer (no learning)
+
+    Args:
+        dim: Number of output dimensions.
+        var_type: Variance mode (`constraint`, `single`, or `fixed`).
+    """
+    # Changed to initialize weight mean as random
+    # Added bias to variance term
     def __init__(self, dim: int, var_type="single"):
         super(DiagonalRegressor, self).__init__()
         self.dim = dim
         self.var_type = var_type
         self.mean_coeff = nn.Parameter(torch.ones(self.dim))
         self.mean_bias = nn.Parameter(torch.zeros(self.dim))
+        # should we fit a bias?
+        # self.mean_bias = nn.Parameter(torch.zeros(self.dim))
+        # Should variance scale with prediction? Will likely mean that higher predictions have lower prob
+        # Variance should be a fixed parameter for each target or should have its own dimension associated with it
+        # This would give a certainty for each sample, not just based on the value of the prediction
+        # For now, model variance
+        # self.var_coeff = nn.Parameter(torch.zeros(self.dim))
+        # self.var_bias = nn.Parameter(torch.zeros(self.dim))
+        # Variance should be learned but not depend on x
         # Below: Learning a variance parameter for each constraint
         if var_type == "constraint":
             self.scale = nn.Parameter(torch.zeros(self.dim))
         # Below: Learning a single variance parameter for all targets
         elif var_type == "single":
             self.scale = nn.Parameter(torch.zeros(1))
+        elif var_type == "fixed":
+            self.register_buffer("scale", torch.zeros(1))
+        # Vector of ones like x to preserve shape for variance, Parameter for pushing to GPU
+        # This starts higher to avoid -inf at the start of training due to initialization of mean_coeff as 1
 
     def forward(self, x: torch.tensor) -> torch.tensor:
+        # return x * self.mean_coeff + self.mean_bias, torch.clamp((x * self.var_coeff + self.var_bias).div(2).exp(),
+        # min=1e-8)
         # Below: per-constraint variance
         if self.var_type == "constraint":
             scale = torch.clamp(self.scale.div(2).exp(), min=1e-3).repeat(
                 (x.shape[0], 1)
             )
         # Below: single variance
-        elif self.var_type == "single":
+        elif self.var_type in ["single", "fixed"]:
             scale = torch.clamp(self.scale.div(2).exp(), min=1e-3).repeat(
                 (x.shape[0], self.dim)
             )
@@ -215,6 +321,12 @@ class DiagonalRegressor(nn.Module):
 
 
 class DiagonalClassifier(nn.Module):
+    """
+    Lightweight classifier wrapper using a Diagonal affine transform.
+
+    Args:
+        dim: Number of dimensions.
+    """
     def __init__(self, dim):
         super(DiagonalClassifier, self).__init__()
         self.dim = dim
@@ -225,18 +337,37 @@ class DiagonalClassifier(nn.Module):
 
 
 class RegressionModel(nn.Module):
-    def __init__(self, dim, zdim=None):
+    """
+    Wrapper for a diagonal Gaussian regressor.
+
+    Args:
+        dim: Number of output dimensions.
+        zdim: Optional latent dimension (kept for interface consistency).
+        var_type: Variance mode passed to DiagonalRegressor.
+    """
+    def __init__(self, dim, zdim=None, var_type="fixed"):
         super(RegressionModel, self).__init__()
         self.dim = dim
         self.zdim = zdim
         print("[INFO] Using diagonal regression...")
-        self.reg = DiagonalRegressor(self.dim)
+        self.reg = DiagonalRegressor(self.dim, var_type=var_type)
 
     def forward(self, x):
         return self.reg(x)
 
 
 class ClassificationModel(nn.Module):
+    """
+    Wrapper for a diagonal classifier.
+
+    Args:
+        dim: Number of output dimensions.
+        fc: Unused flag for compatibility.
+        uneven: Unused flag for compatibility.
+        target: Unused flag for compatibility.
+        zdim: Optional latent dimension (kept for interface consistency).
+        mask: Optional mask (unused).
+    """
     def __init__(self, dim, fc=False, uneven=False, target=False, zdim=None, mask=None):
         super(ClassificationModel, self).__init__()
         self.dim = dim
@@ -252,6 +383,14 @@ class ClassificationModel(nn.Module):
 
 
 class CondPrior(nn.Module):
+    """
+    Binary conditional prior p(z|s) with separate parameters for s=1 and s=0.
+
+    For each dimension, learns loc and scale for the true and false cases.
+
+    Args:
+        dim: Number of conditional dimensions.
+    """
     def __init__(self, dim):
         super(CondPrior, self).__init__()
         self.dim = dim
@@ -267,8 +406,16 @@ class CondPrior(nn.Module):
 
 
 class CondPriorCont(nn.Module):
-    """A conditional prior with one-to-one mapping but continuous, with each constraint having a weight and a bias.
-    Weight is initialised at 1."""
+    """
+    Continuous conditional prior with per-dimension affine loc and learnable scale.
+
+    Loc is modeled as `loc = weight * s + bias`. Scale can be per-dimension
+    (`target`) or shared (`single`).
+
+    Args:
+        dim: Number of conditional dimensions.
+        var_type: Variance mode (`target` or `single`).
+    """
 
     def __init__(self, dim, var_type="single"):
         super(CondPriorCont, self).__init__()
@@ -299,12 +446,31 @@ class CondPriorCont(nn.Module):
 # COMBINED MODEL CLASSES
 class VanillaVAE(nn.Module):
     """
-    Vanilla VAE implementation
+    Standard VAE for tabular inputs with a Gaussian latent space.
+
+    Uses a TabularEncoder to parameterize q(z|x) and a TabularDecoder to
+    reconstruct x from z. Training is unsupervised via the ELBO.
+
+    Args:
+        layer_width: Hidden layer width for encoder/decoder MLPs.
+        n_layers: Number of hidden layers in encoder/decoder.
+        z_dim: Latent dimensionality.
+        input_dim: Input feature dimension.
+        dropout: Dropout probability for encoder/decoder MLPs.
+        use_cuda: Whether to move model and buffers to CUDA.
+
+    Attributes:
+        encoder: TabularEncoder producing q(z|x) parameters.
+        decoder: TabularDecoder reconstructing x from z.
+        z_dim: Latent dimensionality.
+        input_dim: Input feature dimension.
     """
 
-    def __init__(self, model_size, z_dim, input_dim, dropout, use_cuda=True):
+
+    def __init__(self, layer_width, n_layers, z_dim, input_dim, dropout, use_cuda=True):
         super(VanillaVAE, self).__init__()
-        self.model_size = model_size
+        self.layer_width = layer_width
+        self.n_layers = n_layers
         self.dropout = dropout
         self.z_dim = z_dim
         self.input_dim = input_dim
@@ -315,13 +481,15 @@ class VanillaVAE(nn.Module):
         self.encoder = TabularEncoder(
             input_dim=input_dim,
             latent_dim=self.z_dim,
-            model_size=self.model_size,
+            layer_width=self.layer_width,
+            n_layers=self.n_layers,
             dropout=self.dropout,
         )
         self.decoder = TabularDecoder(
             input_dim=input_dim,
             latent_dim=self.z_dim,
-            model_size=self.model_size,
+            layer_width=self.layer_width,
+            n_layers=self.n_layers,
             dropout=self.dropout,
         )
 
@@ -394,12 +562,42 @@ class VanillaVAE(nn.Module):
 
 class iCoVAE(nn.Module):
     """
-    CCVAE modified to use continuous labels
+    Conditional VAE variant with continuous constraints (CCVAE-style).
+
+    The latent space is split into:
+    - `z_s`: constraint-aligned dimensions (one per constraint)
+    - `z_not_s`: remaining unconstrained dimensions
+
+    A diagonal Gaussian regressor predicts constraint values from `z_s`, and a
+    conditional prior `p(z_s | s)` is learned via a continuous conditional prior.
+    Training supports both unsupervised and supervised ELBO objectives.
+
+    Args:
+        layer_width: Hidden layer width for encoder/decoder MLPs.
+        n_layers: Number of hidden layers in encoder/decoder.
+        z_dim: Total latent dimensionality.
+        constraints: List of constraint names (length = number of supervised dims).
+        input_dim: Input feature dimension.
+        dropout: Dropout probability for encoder/decoder MLPs.
+        s_prior_fn_loc: Callable returning prior mean(s) for constraints.
+        s_prior_fn_scale: Callable returning prior scale(s) for constraints.
+        use_cuda: Whether to move model and buffers to CUDA.
+
+    Attributes:
+        num_constraints: Number of constraints (len(constraints)).
+        zs_dim: Latent dimensions aligned to constraints.
+        znots_dim: Remaining latent dimensions.
+        encoder: TabularEncoder producing q(z|x) parameters.
+        decoder: TabularDecoder reconstructing x from z.
+        regressor: Diagonal Gaussian regressor for q(s|z_s).
+        cond_prior: Conditional prior p(z_s|s).
     """
+
 
     def __init__(
         self,
-        model_size,
+        layer_width,
+        n_layers,
         z_dim,
         constraints,
         input_dim,
@@ -409,7 +607,8 @@ class iCoVAE(nn.Module):
         use_cuda=True,
     ):
         super(iCoVAE, self).__init__()
-        self.model_size = model_size
+        self.layer_width = layer_width
+        self.n_layers = n_layers
         self.constraints = constraints
         self.dropout = dropout
         self.num_constraints = len(constraints)
@@ -427,20 +626,22 @@ class iCoVAE(nn.Module):
         self.encoder = TabularEncoder(
             input_dim=input_dim,
             latent_dim=self.z_dim,
-            model_size=self.model_size,
+            layer_width=self.layer_width,
+            n_layers=self.n_layers,
             dropout=self.dropout,
         )
 
         self.decoder = TabularDecoder(
             input_dim=input_dim,
             latent_dim=self.z_dim,
-            model_size=self.model_size,
+            layer_width=self.layer_width,
+            n_layers=self.n_layers,
             dropout=self.dropout,
         )
 
         self.regressor = RegressionModel(self.num_constraints)
 
-        print("[INFO] Using diagonal cond prior...")
+        print("Using diagonal cond prior...")
         self.cond_prior = CondPriorCont(self.num_constraints)
 
         if self.use_cuda:
@@ -493,7 +694,7 @@ class iCoVAE(nn.Module):
         z = dist.Normal(*post_params).rsample()
         zs, znots = z.split([self.zs_dim, self.znots_dim], 1)
         qs_zc = dist.Normal(*self.regressor(zs))
-        # log_qs_zc = qs_zc.log_prob(s).sum(dim=-1)
+        log_qs_zc = qs_zc.log_prob(s).sum(dim=-1)
 
         # compute kl
         locs_p_zc, scales_p_zc = self.cond_prior(s)
@@ -519,11 +720,13 @@ class iCoVAE(nn.Module):
         # print(f"log_ps: {log_ps}")
         # print(f"log_qs_x: {log_qs_x}")
         # print(f"log_pxz: {log_px_z}")
+        # print(f"kl: {kl}")
+        # print(self.regressor.reg.scale)
 
         # we only want gradients wrt to params of qyz, so stop them propogating to qzx
         log_qs_zc_ = dist.Normal(*self.regressor(zs.detach())).log_prob(s).sum(dim=-1)
-        # print(f"log_qyzc_: {log_qyzc_}")
-        w = torch.exp(log_qs_zc_ - log_qs_x)
+        # print(f"log_qs_zc_: {log_qs_zc_}")
+        w = torch.exp(torch.tanh(log_qs_zc_ - log_qs_x))
         elbo = (w * (log_px_z - kl - log_qs_zc_) + log_ps + log_qs_x).mean()
         return -elbo
 
@@ -689,8 +892,20 @@ class iCoVAE(nn.Module):
 
 
 class TargetRegressorDet(nn.Module):
-    """Regressor from VAE representation
-    Does not model distribution, only makes prediction (Det=deterministic)"""
+    """
+    Deterministic MLP regressor over latent or input features.
+
+    Supports linear or multi-layer configurations via `model_size` and applies
+    optional LayerNorm and dropout in hidden layers.
+
+    Args:
+        input_dim: Input feature dimension.
+        output_dim: Output dimension.
+        activation: Activation name (`relu`, `leakyrelu`, or None).
+        model_size: Key into `cf_model_sizes` for layer widths.
+        bn: Whether to apply LayerNorm in hidden layers.
+        dropout: Dropout probability.
+    """
 
     def __init__(
         self,
@@ -753,19 +968,33 @@ class TargetRegressorDet(nn.Module):
 
 class PiCoSK(nn.Module):
     """
-    Class for a model consisting of a pretrained feature extractor and a regression/classification model *from SKLEARN*
-    Encoder weights are frozen
+    Pretrained encoder + scikit-learn regressor/classifier.
+
+    The encoder is frozen and used to generate representations which are then
+    fed into a scikit-learn model. Optionally concatenates covariates and can
+    skip latent reps (`norep=True`).
+
+    Args:
+        encoder: Trained encoder module.
+        args: Namespace of hyperparameters for the sklearn model.
+        model: Model type (`ElasticNet`, `SVR`, `RandomForestRegressor`,
+            `LinearRegression`, `LogisticRegression`, `SVC`).
+        use_cuda: Whether to use CUDA for the encoder.
+        max_ap: Flag used by callers for metric handling.
+        random_state: Random seed for sklearn models.
+        feature_inds: Optional feature index subset (unused in this class).
+        norep: If True, use covariates only (skip latent representation).
+
+    Attributes:
+        metric_type: `classification` or `regression` based on model.
+        scaler: StandardScaler fit on representations.
     """
 
     def __init__(
         self,
         encoder,
+        args,
         model="ElasticNet",
-        alpha=0.001,
-        l1_ratio=0.5,
-        c=1,
-        kernel="linear",
-        eps=0.1,
         use_cuda=True,
         max_ap=True,
         random_state=0,
@@ -774,35 +1003,49 @@ class PiCoSK(nn.Module):
     ):
         super(PiCoSK, self).__init__()
         self.max_ap = max_ap
-        self.alpha = alpha
-        self.l1_ratio = l1_ratio
-        self.c = c
-        self.eps = eps
-        self.kernel = kernel
+        self.args = args
         self.model = model
         self.random_state = random_state
         self.feature_inds = feature_inds
         self.norep = norep
+        if use_cuda:
+            map_loc = torch.device("cuda:0")
+        else:
+            map_loc = "cpu"
         self.encoder = encoder
 
         if self.model == "ElasticNet":
             self.regressor = ElasticNet(
-                self.alpha,
-                l1_ratio=self.l1_ratio,
+                self.args.alpha,
+                l1_ratio=self.args.l1_ratio,
                 random_state=self.random_state,
                 max_iter=10000,
             )
         elif self.model == "SVR":
             self.regressor = SVR(
-                C=self.c, epsilon=self.eps, kernel=self.kernel, max_iter=-1
+                C=self.args.c,
+                epsilon=self.args.eps,
+                kernel=self.args.kernel,
+                max_iter=-1,
+            )
+        elif self.model == "RandomForestRegressor":
+            self.regressor = RandomForestRegressor(
+                n_estimators=self.args.n_estimators,
+                max_depth=self.args.max_depth,
+                min_samples_leaf=self.args.min_samples_leaf,
+                min_samples_split=self.args.min_samples_split,
+                max_features=self.args.max_features,
+                max_samples=self.args.max_samples,
+                criterion="mse",
+                random_state=self.random_state,
             )
         elif self.model == "LinearRegression":
             self.regressor = LinearRegression()
         elif self.model == "LogisticRegression":
             self.regressor = LogisticRegression(
                 penalty="elasticnet",
-                C=1 / self.alpha,
-                l1_ratio=self.l1_ratio,
+                C=1 / self.args.alpha,
+                l1_ratio=self.args.l1_ratio,
                 random_state=self.random_state,
                 class_weight="balanced",
                 solver="saga",
@@ -810,8 +1053,8 @@ class PiCoSK(nn.Module):
             )
         elif self.model == "SVC":
             self.regressor = SVC(
-                C=self.c,
-                kernel=self.kernel,
+                C=self.args.c,
+                kernel=self.args.kernel,
                 probability=True,
                 max_iter=-1,
                 class_weight="balanced",
@@ -873,6 +1116,7 @@ class PiCoSK(nn.Module):
         self.num_targets = gt.shape[1]
 
         # Fit regressor using reps as input, with c concatenated if not NA
+        print(np.isnan(cs).any())
         if not np.isnan(cs).any():
             # If norep, only use c
             if self.norep:
@@ -1131,326 +1375,36 @@ class PiCoSK(nn.Module):
                 json.dump(reg_dict, f, indent=2)
 
 
-class PiCoCox(nn.Module):
-    """
-    Class for a model consisting of a pretrained feature extractor and a Cox PH model from lifelines
-    Encoder weights are frozen
-    """
-
-    def __init__(
-        self,
-        encoder,
-        event_col,
-        duration_col,
-        strata=None,
-        model="ElasticNet",
-        alpha=0.001,
-        l1_ratio=0.5,
-        c=1,
-        kernel="linear",
-        eps=0.1,
-        use_cuda=True,
-        max_ap=True,
-        random_state=0,
-        feature_inds=None,
-        norep=False,
-    ):
-        super(PiCoCox, self).__init__()
-        self.max_ap = max_ap
-        self.alpha = alpha
-        self.l1_ratio = l1_ratio
-        self.c = c
-        self.eps = eps
-        self.kernel = kernel
-        self.model = model
-        self.random_state = random_state
-        self.feature_inds = feature_inds
-        self.norep = norep
-        self.event_col = event_col
-        self.duration_col = duration_col
-        self.strata = strata
-        self.encoder = encoder
-
-        if self.model == "CoxPH":
-            self.regressor = CoxPHFitter(
-                penalizer=self.alpha, l1_ratio=self.l1_ratio, strata=self.strata
-            )
-
-        # Assign metric type for later calculations
-        self.metric_type = "survival"
-
-        self.use_cuda = use_cuda
-
-        # Set to fix batchnorm and dropout layers
-        self.encoder.eval()
-
-        # freeze params for encoder
-        for p in self.encoder.parameters():
-            p.requires_grad = False
-
-        # Push encoder to GPU
-        if use_cuda:
-            self.encoder.cuda()
-
-    def fit_regressor(self, data_loader, fitter_kwargs={}):
-        gt = []
-        zs = []
-        cs = []
-        # Generate representations for all samples
-        for x, s, c, y, idx, st in data_loader:
-            gt.append(y.numpy())
-            if self.use_cuda:
-                x = x.cuda(non_blocking=True)
-            z_mean, _ = self.encoder(x)
-            z_mean = z_mean.detach().cpu().numpy()
-            zs.append(z_mean)
-            cs.append(c.numpy())
-
-        # Concatenate all representations and targets
-        # if len(zs) > 1:
-        zs = np.concatenate(zs, axis=0)
-        gt = np.concatenate(gt, axis=0)
-        cs = np.concatenate(cs, axis=0)
-        # else:
-        #   zs = np.array(zs[0])
-        #  gt = np.array(gt)
-
-        if len(gt.shape) == 1:
-            gt = np.expand_dims(gt, axis=1)
-
-        # This can occur if batch size is 1
-        if len(zs.shape) == 1:
-            zs = np.expand_dims(zs, axis=0)
-        if len(cs.shape) == 1:
-            cs = np.expand_dims(cs, axis=0)
-
-        self.z_dim = zs.shape[1]
-        self.num_targets = gt.shape[1]
-
-        # Fit regressor using reps as input, with c concatenated if not NA
-        if not np.isnan(cs).any():
-            # If norep, only use c
-            if self.norep:
-                zs = cs
-                self.z_dim = 0
-            else:
-                zs = np.concatenate([zs, cs], axis=1)
-            self.c_dim = cs.shape[1]
-        else:
-            self.c_dim = 0
-
-        # STANDARDISE FEATURES
-        self.scaler = StandardScaler()
-
-        self.scaler.fit(zs)
-        zs = self.scaler.transform(zs)
-
-        # Lifelines fitter takes a pandas DataFrame as input
-        col_names = [f"z_{i}" for i in range(self.z_dim)]
-        col_names += [f"c_{i}" for i in range(self.c_dim)]
-        col_names += [self.duration_col, self.event_col]
-        df = pd.DataFrame(np.concatenate([zs, gt], axis=1), columns=col_names)
-
-        # Binarize strata so that test set sees the same values when refitting
-        if self.strata is not None:
-            df[self.strata] = (df[self.strata] < 0).astype(int).astype(float)
-
-        self.regressor.fit(
-            df,
-            duration_col=self.duration_col,
-            event_col=self.event_col,
-            strata=self.strata,
-            **fitter_kwargs,
-        )
-
-    def calculate_metrics(
-        self, data_loader, num_targets, return_roc=False, *args, **kwargs
-    ):
-        # preds = []
-        gts = []
-        zs = []
-        for x, s, c, y, idx, st in data_loader:
-            # Generate predictions for each batch in dataloader
-            if len(y.shape) == 1:
-                y = y.unsqueeze(dim=1)
-            # Append y before cuda
-            gts.append(y)
-            if self.use_cuda:
-                x = x.cuda(non_blocking=True)
-            z, _ = self.encoder(x)
-            if self.use_cuda:
-                z = z.detach().cpu().numpy()
-            else:
-                z = z.detach().numpy()
-
-            # If c not nan, concat with z
-            if not np.isnan(c.numpy()).any():
-                # If norep, only use c
-                if self.norep:
-                    z = c
-                else:
-                    z = np.concatenate([z, c], axis=1)
-
-            # Standardise continuous columns
-            z = self.scaler.transform(z)
-            zs.append(z)
-
-        # Get array of all ground truth and predictions concatenated
-        gts = np.concatenate(gts, axis=0)
-        zs = np.concatenate(zs, axis=0)
-
-        # Calculate metrics
-        # Lifelines fitter takes a pandas DataFrame as input
-        col_names = (
-            [f"z_{i}" for i in range(self.z_dim)]
-            + [f"c_{i}" for i in range(self.c_dim)]
-            + [self.duration_col, self.event_col]
-        )
-        # Make df for testing and drop any NAs
-        df = pd.DataFrame(np.concatenate([zs, gts], axis=1), columns=col_names).dropna(
-            axis=0
-        )
-
-        # Binarize strata so that test set sees the same values when refitting
-        if self.strata is not None:
-            df[self.strata] = (df[self.strata] < 0).astype(int).astype(float)
-
-        if self.metric_type == "survival":
-            log_likelihoods = []
-            c_indexes = []
-            # Use negative log likelihood
-            log_likelihoods.append(
-                -self.regressor.score(df, scoring_method="log_likelihood")
-            )
-            c_indexes.append(
-                self.regressor.score(df, scoring_method="concordance_index")
-            )
-            return (log_likelihoods, c_indexes)
-
-    def generate_predictions(self, data_loader, save_dir, suffix="val"):
-        """Generates latent representation and predictions for all samples in data loader"""
-        zs = []
-        preds = []
-        inds = []
-        ys = []
-        self.eval()
-        self.encoder.eval()
-
-        for x, s, c, y, idx, st in data_loader:
-            if self.use_cuda:
-                x = x.cuda()
-            z, _ = self.encoder(x)
-            if self.use_cuda:
-                z = z.detach().cpu().numpy()
-            else:
-                z = z.detach().numpy()
-
-            # Concatenate z with c if c is not nan
-            if not np.isnan(c.numpy()).any():
-                # If norep, only use c
-                if self.norep:
-                    z = c
-                else:
-                    z = np.concatenate([z, c], axis=1)
-
-            # z[:, self.scale_cols] = self.scaler.transform(z[:, self.scale_cols])
-            z = self.scaler.transform(z)
-
-            # Lifelines fitter takes a pandas DataFrame as input
-            col_names = [f"z_{i}" for i in range(self.z_dim)] + [
-                f"c_{i}" for i in range(self.c_dim)
-            ]  # + [self.duration_col, self.event_col]
-            # Make df for testing and drop any NAs
-            df = pd.DataFrame(z, columns=col_names).dropna(axis=0)
-
-            # Binarize strata so that test set sees the same values when refitting
-            if self.strata is not None:
-                df[self.strata] = (df[self.strata] < 0).astype(int).astype(float)
-
-            pred = self.regressor.predict_survival_function(df).transpose()
-
-            zs.append(z)
-            preds.append(pred)
-            ys.append(y.numpy())
-            inds.append(idx.numpy())
-
-        z_arr = np.concatenate(zs, axis=0)
-        pred_arr = np.concatenate(preds, axis=0)
-        ind_arr = np.concatenate(inds, axis=0)
-        y_arr = np.concatenate(ys, axis=0)
-
-        z_cols = []
-        if not self.norep:
-            for i in range(self.z_dim):
-                # zc_cols.append(f"zc_{i}")
-                z_cols.append(f"z_{i}")
-        for i in range(self.c_dim):
-            z_cols.append(f"c_{i}")
-
-        ind_df = pd.DataFrame(ind_arr, columns=["ind"])
-        z_df = pd.DataFrame(z_arr, columns=z_cols)
-        pred_df = pd.DataFrame(
-            pred_arr, columns=[f"pred_{col}" for col in pred.columns]
-        )  # , columns=pred_cols)
-        y_df = pd.DataFrame(y_arr, columns=[self.duration_col, self.event_col])
-
-        results_df = pd.concat([ind_df, z_df, pred_df, y_df], axis=1)
-
-        results_df.to_csv(f"{save_dir}/z_pred_{suffix}.csv")
-
-    def forward(self, x, c):
-        z, _ = self.encoder(x)
-        if self.use_cuda:
-            z = z.detach().cpu().numpy()
-        else:
-            z = z.detach().numpy()
-
-        # Concatenate z with c if c is not nan
-        if not np.isnan(c.numpy()).any():
-            # If norep, only use c
-            if self.norep:
-                z = c
-            else:
-                z = np.concatenate([z, c], axis=1)
-
-        z = self.scaler.transform(z)
-
-        pred = self.regressor.predict_survival_function(z)
-
-        return pred
-
-    def save_models(self, seed, path="./data"):
-        # SAVE ENCODER
-        torch.save(self.encoder, os.path.join(path, "encoder.pt"))
-        # SAVE COEFFS
-        if self.model == "CoxPH":
-            reg_coeffs = self.regressor.params_.astype(float).tolist()
-            reg_hrs = self.regressor.hazard_ratios_.astype(float).tolist()
-            reg_cis = self.regressor.confidence_intervals_.astype(float)
-            reg_dict = {
-                "coeffs": reg_coeffs,
-                "hrs": reg_hrs,
-                "cis_lower": reg_cis.iloc[:, 0].tolist(),
-                "cis_upper": reg_cis.iloc[:, 1].tolist(),
-            }
-            with open(os.path.join(path, f"regressor_s{seed}.txt"), "w") as f:
-                json.dump(reg_dict, f, indent=2)
-
-
 class BaselineNN(nn.Module):
     """
-    Class for a model consisting of only a regression model, using a neural network
+    Neural-network baseline regressor without a VAE.
+
+    Wraps a deterministic MLP regressor and provides MSE/RMSE evaluation and
+    prediction export utilities.
+
+    Args:
+        input_dim: Input feature dimension.
+        output_dim: Output dimension.
+        dropout: Dropout probability for the regressor.
+        n_layers: Number of hidden layers.
+        layer_width: Hidden layer width.
+        use_cuda: Whether to move model to CUDA.
     """
 
     def __init__(
-        self, input_dim, output_dim, dropout, reg_model_size="s", use_cuda=True
+        self, input_dim, output_dim, dropout, n_layers, layer_width, use_cuda=True
     ):
         super(BaselineNN, self).__init__()
+        if use_cuda:
+            map_loc = torch.device("cuda:0")
+        else:
+            map_loc = "cpu"
         self.dropout = dropout
         self.regressor = TargetRegressorDet(
             input_dim=input_dim,
             output_dim=output_dim,
-            model_size=reg_model_size,
+            n_layers=n_layers,
+            layer_width=layer_width,
             dropout=self.dropout,
         )
         self.num_targets = output_dim
@@ -1461,15 +1415,15 @@ class BaselineNN(nn.Module):
 
     def regressor_loss(self, x, y, k=100):
         """
-        Computes the loss. Sample k times from z.
+        Computes the MSE loss. Sample k times from z.
         Alternative: Use MAP representation or distribution embedding
         """
         y_pred = self.regressor(x)
         y_pred = y_pred.view(-1, self.num_targets)
         y = y.view(-1, self.num_targets)
-        rmse = (y - y_pred).square().float().mean(dim=0).sqrt()
+        mse = (y - y_pred).square().float().mean(dim=0)
 
-        return rmse
+        return mse
 
     def regressor_rmse(self, x, y=None, k=1):
         y_pred = self.regressor(x)
@@ -1522,7 +1476,9 @@ class BaselineNN(nn.Module):
 
     def generate_predictions(self, data_loader, save_dir, suffix="val"):
         """Generates latent representation and predictions for all samples in data loader"""
-
+        # z_arr = np.zeros((len(data_loader), self.z_dim))
+        # pred_arr = np.zeros((len(data_loader), self.num_targets))
+        # ind_arr = np.zeros(len(data_loader), 1)
         preds = []
         idxs = []
         ys = []
@@ -1538,6 +1494,13 @@ class BaselineNN(nn.Module):
             preds.append(pred.cpu().numpy())
             idxs.append(idx.numpy())
             ys.append(y.numpy())
+
+            # ind_arr[i, :] = ind.numpy()
+            # z_arr[i, :] = z_params[0].cpu().numpy()
+            # pred_arr[i, :] = pred.cpu().numpy()
+            # Update counter, accounts for variable batch sizes and shuffled inds when input dataset is split version
+            # of another
+            # i = i + 1
 
         pred_arr = np.concatenate(preds, axis=0)
         idx_arr = np.concatenate(idxs, axis=0)
@@ -1566,28 +1529,66 @@ class BaselineNN(nn.Module):
 
 class BaselineSK(nn.Module):
     """
-    Class for a model consisting of a regression model *from SKLEARN*
+    scikit-learn baseline regressor with optional PCA.
+
+    Fits a scaler (and optional PCA) on raw inputs, then trains an sklearn
+    regressor. Provides metric computation and prediction export utilities.
+
+    Args:
+        args: Namespace with model hyperparameters.
+        reg_model: Model type (`ElasticNet`, `Lasso`, `SVR`, `RandomForestRegressor`).
+        fit_pca: Whether to apply PCA before fitting.
+        pca_dim: PCA dimensionality if `fit_pca=True`.
+
+    Attributes:
+        scaler: StandardScaler fit on inputs.
+        pca: PCA transformer (only if `fit_pca=True`).
+        metric_type: `classification` or `regression` based on model.
     """
 
-    def __init__(self, reg_model="ElasticNet", alpha=0.001, c=1, eps=0.1):
+    def __init__(self, args, reg_model="ElasticNet", fit_pca=False, pca_dim=64):
         super(BaselineSK, self).__init__()
-        self.alpha = alpha
-        self.c = c
-        self.eps = eps
+        self.args = args
         self.reg_model = reg_model
+        # Whether to run a PCA on the input data before fitting the regressor
+        self.fit_pca = fit_pca
+        self.pca_dim = pca_dim
+        # Placeholder for PCA object
+        self.pca = None
 
         if self.reg_model == "ElasticNet":
-            self.regressor = ElasticNet(self.alpha)
+            self.regressor = ElasticNet(
+                alpha=self.args.alpha,
+                l1_ratio=self.args.l1_ratio,
+                random_state=self.args.seed,
+            )
         elif self.reg_model == "Lasso":
-            self.regressor = Lasso(self.alpha)
+            self.regressor = Lasso(self.args.alpha)
         elif self.reg_model == "SVR":
-            self.regressor = SVR(C=self.c, epsilon=self.eps, kernel="linear")
+            self.regressor = SVR(C=self.args.c, epsilon=self.args.eps, kernel="linear")
+        elif self.reg_model == "RandomForestRegressor":
+            self.regressor = RandomForestRegressor(
+                n_estimators=self.args.n_estimators,
+                max_depth=self.args.max_depth,
+                min_samples_leaf=self.args.min_samples_leaf,
+                min_samples_split=self.args.min_samples_split,
+                max_features=self.args.max_features,
+                max_samples=self.args.max_samples,
+                criterion="mse",
+                random_state=self.args.seed,
+            )
+
+        # Assign metric type for later calculations
+        if self.reg_model in ["SVC", "LogisticRegression"]:
+            self.metric_type = "classification"
+        else:
+            self.metric_type = "regression"
 
     def fit_regressor(self, data_loader):
         gt = []
         xs = []
         # Generate representations for all samples
-        for x, y, ind in data_loader:
+        for x, s, c, y, ind, st in data_loader:
             gt.append(y)
             xs.append(x)
 
@@ -1598,6 +1599,19 @@ class BaselineSK(nn.Module):
         if len(gt.shape) == 1:
             gt = np.expand_dims(gt, axis=1)
 
+        # Standard scaling
+        self.scaler = StandardScaler()
+
+        self.scaler.fit(xs)
+
+        xs = self.scaler.transform(xs)
+
+        # Run PCA if specified
+        if self.fit_pca:
+            print("[INFO] Fitting PCA...")
+            self.pca = PCA(n_components=self.pca_dim)
+            xs = self.pca.fit_transform(xs)
+
         self.input_dim = xs.shape[1]
         self.num_targets = gt.shape[1]
 
@@ -1607,13 +1621,19 @@ class BaselineSK(nn.Module):
     def calculate_metrics(self, data_loader, num_targets, *args, **kwargs):
         preds = []
         gt = []
-        for x, y, _ in data_loader:
+        for x, s, c, y, ind, st in data_loader:
             # Generate predictions for each batch in dataloader
             # Append y before cuda
             gt.append(y)
             if len(y.shape) == 1:
-                unsqueeze = True
                 y = y.unsqueeze(dim=1)
+
+            x = self.scaler.transform(x)
+
+            # Transform with PCA if necessary
+            if self.fit_pca:
+                x = self.pca.transform(x)
+
             batch_preds = self.regressor.predict(x)
             # Save the predictions
             preds.append(batch_preds)
@@ -1621,33 +1641,56 @@ class BaselineSK(nn.Module):
         gt = np.concatenate(gt, axis=0)
         preds = np.concatenate(preds, axis=0)
         # Fix dimensions if there is only one target
-        if unsqueeze:
+        if len(gt.shape) == 1:
             gt = np.expand_dims(gt, axis=1)
+        if len(preds.shape) == 1:
             preds = np.expand_dims(preds, axis=1)
         # Calculate metrics
         pearson_rs = []
         spearman_rs = []
         rmses = []
         for i in range(num_targets):
-            pearson_rs.append(pearsonr(preds[:, i], gt[:, i])[0])
-            spearman_rs.append(spearmanr(preds[:, i], gt[:, i])[0])
-            rmses.append(np.sqrt(np.mean(np.square(preds - gt))))
+            curr_pred = preds[:, i]
+            curr_gt = gt[:, i]
+            curr_pred = np.squeeze(curr_pred)
+            curr_gt = np.squeeze(curr_gt)
+
+            nas = np.logical_or(np.isnan(curr_pred), np.isnan(curr_gt))
+
+            pearson_rs.append(pearsonr(curr_pred[~nas], curr_gt[~nas])[0])
+            spearman_rs.append(spearmanr(curr_pred[~nas], curr_gt[~nas])[0])
+            rmses.append(np.sqrt(np.mean(np.square(curr_pred[~nas] - curr_gt[~nas]))))
         return rmses, pearson_rs, spearman_rs
 
     def generate_predictions(self, data_loader, save_dir, suffix="val"):
         """Generates latent representation and predictions for all samples in data loader"""
+        # z_arr = np.zeros((len(data_loader), self.z_dim))
+        # pred_arr = np.zeros((len(data_loader), self.num_targets))
+        # ind_arr = np.zeros(len(data_loader), 1)
         preds = []
         inds = []
         gts = []
         self.eval()
         # counter for filling results array
         # i = 0
-        for x, y, ind in data_loader:
+        for x, s, c, y, ind, st in data_loader:
+            x = self.scaler.transform(x)
+            # Transform with PCA if necessary
+            if self.fit_pca:
+                x = self.pca.transform(x)
+
             pred = self.regressor.predict(x)
 
             preds.append(pred)
             gts.append(y)
             inds.append(ind.numpy())
+
+            # ind_arr[i, :] = ind.numpy()
+            # z_arr[i, :] = z_params[0].cpu().numpy()
+            # pred_arr[i, :] = pred.cpu().numpy()
+            # Update counter, accounts for variable batch sizes and shuffled inds when input dataset is split version
+            # of another
+            # i = i + 1
 
         pred_arr = np.concatenate(preds, axis=0)
         gt_arr = np.concatenate(gts, axis=0)
@@ -1666,21 +1709,36 @@ class BaselineSK(nn.Module):
         results_df.to_csv(f"{save_dir}/z_pred_{suffix}.csv")
 
     def forward(self, x):
+        x = self.scaler.transform(x)
+        # Transform with PCA if necessary
+        if self.fit_pca:
+            x = self.pca.transform(x)
+
         pred = self.regressor.predict(x)
 
         return pred
 
-    def save_models(self, path="./data", fold=0):
+    def save_models(self, path="./data", fold=0, seed=10):
         # SAVE COEFFS
         if self.reg_model == "ElasticNet":
             reg_coeffs = self.regressor.coef_.astype(float).tolist()
             reg_intercept = self.regressor.intercept_.astype(float).tolist()
             reg_dict = {"coeffs": reg_coeffs, "intercept": reg_intercept}
-            with open(os.path.join(path, "regressor.txt"), "w") as f:
+            with open(os.path.join(path, f"regressor_{seed}.txt"), "w") as f:
                 json.dump(reg_dict, f, indent=2)
         elif self.reg_model == "SVR":
             reg_coeffs = self.regressor.coef_.astype(float).tolist()
             reg_intercept = self.regressor.intercept_.astype(float).tolist()
             reg_dict = {"coeffs": reg_coeffs, "intercept": reg_intercept}
-            with open(os.path.join(path, "regressor.txt"), "w") as f:
+            with open(os.path.join(path, f"regressor_{seed}.txt"), "w") as f:
                 json.dump(reg_dict, f, indent=2)
+        if self.fit_pca:
+            with open(os.path.join(path, f"pca_components_{seed}.txt"), "w") as f:
+                pca_dict = {
+                    "components": self.pca.components_.astype(float).tolist(),
+                    "mean": self.pca.mean_.astype(float).tolist(),
+                    "explained_variance_ratio": self.pca.explained_variance_ratio_.astype(
+                        float
+                    ).tolist(),
+                }
+                json.dump(pca_dict, f, indent=2)

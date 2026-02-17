@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 
 from utils.data_utils import Manual, get_data_loaders, process_data
-from models.pico import PiCoSK, PiCoCox, get_search_spaces
+from models.pico import BaselineSK, get_search_spaces
 
 import os
 import json
@@ -55,12 +55,11 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
     # SELECT PARAMETERS
     search_spaces = get_search_spaces(args.reg)
 
-    # Set parameters for optuna trial from search space.
-    # Make sure they are always presented in the same alphabetical order
+    # Set parameters for optuna trial from search space
+    # Make sure they always present in the same order
     for key in sorted(search_spaces):
         setattr(args, key, trial.suggest_categorical(key, search_spaces[key]))
 
-    trial.set_user_attr("enc", args.enc)
     trial.set_user_attr("seed", args.seed)
 
     # Default filtering for variance above 1 in x
@@ -97,27 +96,17 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
                 )
                 return previous_trial.value
 
-    if args.cuda:
-        map_loc = torch.device("cuda:0")
-    else:
-        map_loc = "cpu"
-
-    # LOAD ENCODER USE IN ALL FOLDS
-    encoder = torch.load(
-        f"{args.enc_path}/encoder_{args.seed}.pt", map_location=map_loc
-    )
-
     # Start a new wandb run to track this script.
     # run = wandb.init(name=f"{'_'.join(args.save_folder.split('/')[-5:])}_{'train' if hopt else 'test'}",
-    # Set the wandb entity where your project will be logged (generally your team name).
-    #     entity="nifnet",
-    # Set the wandb project where this run will be logged.
-    #    project="pico",
-    # Track hyperparameters and run metadata.
-    #    config=args,
-    #    mode="offline",
-    #    dir=f"{wd_path}/data/wandb",
-    # )
+    #         # Set the wandb entity where your project will be logged (generally your team name).
+    #         entity="nifnet",
+    #         # Set the wandb project where this run will be logged.
+    #         project="pico",
+    #         # Track hyperparameters and run metadata.
+    #         config=args,
+    #         mode="offline",
+    #         dir=f"{wd_path}/data/wandb",
+    #     )
 
     for curr_fold in range(cv_num):
         if not hopt:
@@ -141,37 +130,12 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
         # print(f"Input dim: {input_dim}")
 
         # CREATE PICO MODEL
-        if args.reg == "CoxPH":
-            if args.strata is not None:
-                strata = [f"c_{args.confounders.index(st)}" for st in args.strata]
-            else:
-                strata = None
-            model = PiCoCox(
-                encoder=encoder,
-                model=args.reg,
-                use_cuda=args.cuda,
-                alpha=args.alpha,
-                l1_ratio=args.l1_ratio,
-                norep=args.norep,
-                duration_col=args.duration_event[0],
-                event_col=args.duration_event[1],
-                strata=strata,
-                random_state=args.seed,
-            )
-        else:
-            model = PiCoSK(
-                encoder=encoder,
-                model=args.reg,
-                args=args,
-                use_cuda=args.cuda,
-                norep=args.norep,
-                random_state=args.seed,
-            )
-
-        # PyTorch 2 compiler for encoder for inference speed
-        model = torch.compile(model)
-
-        model.eval()
+        model = BaselineSK(
+            reg_model=args.reg,
+            args=args,
+            fit_pca=args.pca,
+            pca_dim=args.pca_dim,
+        )
 
         metric_names = {
             "classification": ["cross_entropy", "f1", "aupr", "auroc"],
@@ -179,78 +143,73 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
             "survival": ["neg_log_likelihood", "concordance_index"],
         }
 
-        with torch.no_grad():
-            # FIT REGRESSOR
-            model.fit_regressor(data_loaders["train"])
+        # FIT REGRESSOR
+        model.fit_regressor(data_loaders["train"])
 
-            if hopt:
-                # GENERATE PREDICTIONS FOR VAL SET
-                metrics = model.calculate_metrics(data_loaders["val"], 1)
-                if save_preds:
-                    model.generate_predictions(
-                        data_loaders["val"],
-                        args.save_folder,
-                        suffix=f"val_{curr_fold}_best_s{args.seed}",
-                    )
+        if hopt:
+            # GENERATE PREDICTIONS FOR VAL SET
+            metrics = model.calculate_metrics(data_loaders["val"], 1)
+            if save_preds:
+                model.generate_predictions(
+                    data_loaders["val"],
+                    args.save_folder,
+                    suffix=f"val_{curr_fold}_best_s{args.seed}",
+                )
 
-                print(f"\n[Seed {args.seed} Fold {curr_fold}] Validation")
-                print(f"{'-' * 40}")
-                print(f"{'Metric':<30}{'Value'}")
-                print(f"{'-' * 40}")
+            print(f"\n[Seed {args.seed} Fold {curr_fold}] Validation")
+            print(f"{'-' * 40}")
+            print(f"{'Metric':<30}{'Value'}")
+            print(f"{'-' * 40}")
+            for i in range(len(metrics)):
+                print(f"{metric_names[model.metric_type][i]:<30}{metrics[i][0]:.4f}")
+            print(f"{'-' * 40}")
+
+            if curr_fold == 0:
+                fold_metrics = {
+                    metric_name: [metrics[i][0]]
+                    for i, metric_name in enumerate(metric_names[model.metric_type])
+                }
+            else:
+                for i, metric_name in enumerate(metric_names[model.metric_type]):
+                    fold_metrics[metric_name].append(metrics[i][0])
+
+        else:
+            # GENERATE PREDICTIONS FOR TEST SET
+            if "test" in data_loaders.keys():
+                metrics = model.calculate_metrics(data_loaders["test"], 1)
+                print(f"\n[Seed {args.seed}] Test")
+                print(f"{'-' * 30}")
+                print(f"{'Metric':<20}{'Value'}")
+                print(f"{'-' * 30}")
                 for i in range(len(metrics)):
                     print(
                         f"{metric_names[model.metric_type][i]:<30}{metrics[i][0]:.4f}"
                     )
-                print(f"{'-' * 40}")
+                print(f"{'-' * 30}")
 
-                if curr_fold == 0:
-                    fold_metrics = {
-                        metric_name: [metrics[i][0]]
-                        for i, metric_name in enumerate(metric_names[model.metric_type])
-                    }
-                else:
-                    for i, metric_name in enumerate(metric_names[model.metric_type]):
-                        fold_metrics[metric_name].append(metrics[i][0])
-
-            else:
-                # GENERATE PREDICTIONS FOR TEST SET
-                with torch.no_grad():
-                    if "test" in data_loaders.keys():
-                        model.eval()
-                        metrics = model.calculate_metrics(data_loaders["test"], 1)
-                        print(f"\n[Seed {args.seed}] Test")
-                        print(f"{'-' * 30}")
-                        print(f"{'Metric':<20}{'Value'}")
-                        print(f"{'-' * 30}")
-                        for i in range(len(metrics)):
-                            print(
-                                f"{metric_names[model.metric_type][i]:<30}{metrics[i][0]:.4f}"
-                            )
-                        print(f"{'-' * 30}")
-
-                with torch.no_grad():
-                    if "test" in data_loaders.keys():
-                        model.generate_predictions(
-                            data_loaders["test"],
-                            save_folder,
-                            suffix=f"test_s{args.seed}",
-                        )
-                    model.generate_predictions(
-                        data_loaders["train"], save_folder, suffix=f"train_s{args.seed}"
-                    )
+            if "test" in data_loaders.keys():
+                model.generate_predictions(
+                    data_loaders["test"],
+                    save_folder,
+                    suffix=f"test_s{args.seed}",
+                )
+            model.generate_predictions(
+                data_loaders["train"], save_folder, suffix=f"train_s{args.seed}"
+            )
 
     if hopt:
         # SAVE TRIAL RESULTS
         folds_df_dict = {"fold": range(cv_num)}
         for key, val in fold_metrics.items():
             folds_df_dict[f"val_{key}"] = val
+
             # Run summary with mean over folds
             # run.summary[f"val_{key}"] = float(np.nanmean(val))
 
         if save_preds:
-            # Only triggered when refitting the best trial
             folds_df = pd.DataFrame.from_dict(folds_df_dict)
 
+            # Don't need to save the below
             folds_df.to_csv(f"{args.save_folder}/cv_results_best_s{args.seed}.csv")
 
         # SAVE TRIAL ARGS -- INCLUDING BEST VAL LOSS AND BEST EPOCH
@@ -261,10 +220,6 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
         # with open(f"{args.save_folder}/args_{trial.number}_s{args.seed}.txt", "w") as f:
         #     json.dump(args.__dict__, f, indent=2)
 
-        # wandb_fold_metrics = {metric_name: metrics[i][0] for i, metric_name in enumerate(metric_names[model.metric_type])}
-
-        # Wandb logging
-        # run.summary(wandb_fold_metrics)
         # trigger_sync()
         # run.finish()
 
@@ -303,13 +258,6 @@ def parser_args(parser):
         help="Dataset name (e.g. depmap_gdsc)",
     )
     parser.add_argument(
-        "-enc",
-        type=str,
-        default="iCoVAE",
-        metavar="M",
-        help="Encoder type",
-    )
-    parser.add_argument(
         "-reg",
         type=str,
         default="ElasticNet",
@@ -317,18 +265,17 @@ def parser_args(parser):
         help="Regressor type",
     )
     parser.add_argument(
-        "-constraints",
-        default=None,
-        type=str,
-        nargs="+",
-        help="If specified, uses encoder with these constraints rather than using defaults/selecting automatically",
-    )
-    parser.add_argument(
         "--confounders",
         default=None,
         type=str,
         nargs="+",
         help="Confounders for prediction model",
+    )
+    parser.add_argument(
+        "--pca",
+        default=False,
+        action="store_true",
+        help="Whether to fit a PCA on the input data before fitting the regression model",
     )
     parser.add_argument(
         "--duration-event",
@@ -353,13 +300,6 @@ def parser_args(parser):
         help="Minmax normalize input data in range 0-1",
     )
     parser.add_argument(
-        "-ld",
-        "--lindec",
-        default=False,
-        action="store_true",
-        help="Use a linear decoder?",
-    )
-    parser.add_argument(
         "--filt",
         type=str,
         default="uni_var",
@@ -370,18 +310,6 @@ def parser_args(parser):
         default=None,
         type=str,
         help="Experiment to run (user defined in data loading class)",
-    )
-    parser.add_argument(
-        "--cuda",
-        default=False,
-        action="store_true",
-        help="use GPU(s) for encoder inference (not suggested)",
-    )
-    parser.add_argument(
-        "--norep",
-        default=False,
-        action="store_true",
-        help="Whether to make a prediction model without using a representation",
     )
     parser.add_argument(
         "--newstudy",
@@ -400,46 +328,35 @@ if __name__ == "__main__":
 
     # Unless specified, assume model type is same drug with same seed
     # Otherwise leave as is
-    # TODO: added  for different model version
-    if args.enc == "VAE":
-        args.enc_path = f"{wd_path}/data/outputs/{args.dataset}/{args.target}"
-        if args.experiment is not None:
-            args.enc_path = f"{args.enc_path}/{args.experiment}/vae"
-        else:
-            args.enc_path = f"{args.enc_path}/default/vae"
-    elif args.enc == "iCoVAE":
-        args.enc_path = f"{wd_path}/data/outputs/{args.dataset}/{args.target}"
-        if args.experiment is not None:
-            args.enc_path = f"{args.enc_path}/{args.experiment}/icovae"
-        else:
-            args.enc_path = f"{args.enc_path}/default/icovae"
+    args.model_path = f"{wd_path}/data/outputs/{args.dataset}/{args.target}"
+    if args.experiment is not None:
+        args.model_path = f"{args.model_path}/{args.experiment}"
+    else:
+        args.model_path = f"{args.model_path}/default"
 
-    if (args.constraints is not None) and (args.enc == "iCoVAE"):
-        # If self defined constraints suffix with first constraint then number of constraints
-        args.enc_path = f"{args.enc_path}_{args.constraints[0]}_{len(args.constraints)}"
-
-    if args.lindec:
-        # If using a linear decoder
-        args.enc_path = f"{args.enc_path}_ld"
-
-    save_ext = args.enc_path.split("/")[-1]
+    save_ext = args.model_path.split("/")[-1]
 
     if args.confounders is not None:
         save_ext = f"{save_ext}_{args.confounders[0]}_{len(args.confounders)}"
 
-    if args.norep:
-        save_ext = f"{save_ext}_norep"
+    # Unless specified, assume model type is same drug with same seed
+    # Otherwise leave as is
+    args.enc_path = f"{wd_path}/data/outputs/{args.dataset}/{args.target}"
+    if args.experiment is not None:
+        args.enc_path = f"{args.enc_path}/{args.experiment}/icovae"
+    else:
+        args.enc_path = f"{args.enc_path}/default/icovae"
 
-    # LOAD ARGUMENTS FOR ENCODER
+    # LOAD ARGUMENTS FOR ENCODER -- REQUIRED TO USE THE SAME CONSTRAINTS IN DATA LOADING and keep same data points
     with open(f"{args.enc_path}/args_best.txt", "r") as f:
         enc_args = json.load(f)
 
     # These are the same for every seed
-    if args.enc == "VAE":
-        args.constraints = enc_args["curr_constraints"]
-    elif args.enc == "iCoVAE":
-        args.constraints = enc_args["curr_constraints"]
+    args.constraints = enc_args["curr_constraints"]
     args.test_samples = enc_args["test_samples"]
+
+    # If using PCA, use the same dimensionality as the encoder
+    args.pca_dim = enc_args["z_dim"]
 
     # enc_args = pd.Series(enc_args).to_frame().T
     # Get constraints from enc args
@@ -455,7 +372,9 @@ if __name__ == "__main__":
     print(f"Number of trials to run for {args.reg}: {n_trials}")
 
     # timestr = time.strftime("%Y%m%d_%H%M%S")
-    save_folder = f"{wd_path}/data/outputs/{args.dataset}/{args.target}/{args.experiment}/pico/{args.reg}_{save_ext}"
+    save_folder = f"{wd_path}/data/outputs/{args.dataset}/{args.target}/{args.experiment}/{args.reg}"
+    if args.pca:
+        save_folder = f"{save_folder}_pca"
     # save_folder = f"./data/outputs/{timestr}"
     if not os.path.exists(save_folder):
         os.makedirs(save_folder, exist_ok=True)
@@ -479,7 +398,7 @@ if __name__ == "__main__":
     if args.newstudy:
         try:
             optuna.delete_study(
-                storage=f"sqlite:////{save_folder}/pico_optuna.db",
+                storage=f"sqlite:////{save_folder}/sk_optuna.db",
                 study_name="_".join(save_folder.split("/")[-5:]) + f"_s{args.seed}",
             )
         except:
@@ -487,7 +406,7 @@ if __name__ == "__main__":
 
     # These models fit quickly and search space is small so we fit all combinations of hyperparams
     storage = optuna.storages.RDBStorage(
-        url=f"sqlite:////{save_folder}/pico_optuna.db",
+        url=f"sqlite:////{save_folder}/sk_optuna.db",
         engine_kwargs={"connect_args": {"timeout": 100}},
     )
     study = optuna.create_study(
@@ -509,7 +428,7 @@ if __name__ == "__main__":
     study_df.to_csv(f"{args.save_folder}/opt_study_results_s{args.seed}.csv")
 
     # REFIT MODEL USING BEST TRIAL
-    # RUN HOPT AGAIN BUT SAVE PREDICTIONS!
+    # RUN HOPT AGAIN BUT SAVE PREDICTIONS
     main(study.best_trial, x=x, s=s, c=c, y=y, args=args, hopt=True, save_preds=True)
     # REFIT ON ALL SAMPLES
     metrics = main(study.best_trial, x=x, s=s, c=c, y=y, args=args, hopt=False)

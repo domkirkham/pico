@@ -33,10 +33,12 @@ import seaborn as sns
 
 
 def ensg_column_renamer(name):
+    """Strip version suffix from ENSEMBL IDs (e.g., ENSG... .1 -> ENSG...)."""
     return name.split(".")[0]
 
 
 def type_renamer(x):
+    """Normalize lineage/type strings by replacing spaces and slashes with underscores."""
     x = "_".join((x.split(" ")))
     return "_".join(x.split("/"))
 
@@ -47,15 +49,18 @@ def normalise(x):
 
 
 def scanb_row_renamer(name):
+    """Strip version suffix from ScanB row identifiers."""
     return name.split(".")[0]
 
 
 def extract_all(archives, extract_path):
+    """Extract a list of archive files to a target directory."""
     for filename in archives:
         shutil.unpack_archive(filename, extract_path)
 
 
 def optimize_dtype(column):
+    """Downcast a pandas Series to int for binary-like data, else float32."""
     # Check if unique values are [0, 1] (binary-like values)
     unique_values = column.unique()
     if set(np.round(unique_values, 6)) <= {0, 1}:
@@ -90,7 +95,17 @@ def feature_selection_pca(x_train, x, num_features=1000):
 
 
 class ConstraintSelectorV2:
-    """New class for selecting constraints"""
+    """
+    Utility for selecting gene constraints using linear-model screens.
+
+    Loads the requested dataset, assembles confounders, and provides
+    cross-validation or linear-model based selection with optional caching.
+
+    Args:
+        dataset_name: Dataset identifier (e.g. `depmap_gdsc`, `depmap_ctrp`).
+        experiment: Optional experiment suffix for dataset paths.
+        wd_path: Working directory root for data files and outputs.
+    """
 
     def __init__(self, dataset_name="depmap_gdsc", experiment=None, wd_path=None):
         self.joined_df = None
@@ -131,6 +146,7 @@ class ConstraintSelectorV2:
             os.makedirs(f"{self.wd_path}/data/constraints")
 
     def _make_screen_df(self, drug):
+        """Build a merged dataframe of constraints, confounders, and targets."""
         self.drug = drug
 
         dataset = Manual(
@@ -179,9 +195,11 @@ class ConstraintSelectorV2:
         return joined_df
 
     def _load_prism(self):
+        """Placeholder for PRISM data loading (not implemented)."""
         raise NotImplementedError()
 
     def _test_constraint_cv(self, gene):
+        """Evaluate a single gene constraint in CV using OLS and return metrics."""
         model_formula = f"{self.drug}_y ~ {str(gene)}_s + {self.cov_formula}"
         try:
             mod1 = ols(model_formula, data=self.train_df)
@@ -209,6 +227,7 @@ class ConstraintSelectorV2:
             return {"val_pearson": np.nan, "val_spearman": np.nan, "gene": gene}
 
     def _test_constraint_lm(self, gene, print_summary=False):
+        """Evaluate a single gene with a likelihood ratio test vs base model."""
         model_formula = f"{self.drug}_y ~ {str(gene)} + {self.cov_formula}"
         # Create base model should use same data as above, to deal with missing values
         base_formula = f"{self.drug}_y ~ {self.cov_formula}"
@@ -237,6 +256,7 @@ class ConstraintSelectorV2:
         use_cache=False,
         save_path=None,
     ):
+        """Run CV-based constraint selection and return a results dataframe."""
         if (self.joined_df is None) or (not use_cache):
             self.joined_df = self._make_screen_df(
                 drug=drug, c_type=c_type, covariates=covariates
@@ -303,6 +323,7 @@ class ConstraintSelectorV2:
         use_cache=False,
         save_path=None,
     ):
+        """Run linear-model constraint selection and return a results dataframe."""
         if (self.joined_df is None) or (not use_cache):
             self.joined_df = self._make_screen_df(
                 drug=drug,
@@ -361,6 +382,7 @@ class ConstraintSelectorV2:
         return self.res_df
 
     def filter_cv(self, res_df, method="corr_filt"):
+        """Filter CV results (e.g., correlation-based heuristics)."""
         if method == "corr_filt":
             # Selection by correlation filtering (simple heuristic)
             top_genes = (
@@ -385,6 +407,7 @@ class ConstraintSelectorV2:
             return None
 
     def filter_lm(self, res_df, method="corr_filt", thresh=0.5):
+        """Filter LM results to reduce collinearity among top hits."""
         if method == "corr_filt":
             # Selection by correlation filtering (simple heuristic)
             top_genes = res_df.sort_values("p_corrected").head(200)
@@ -407,6 +430,7 @@ class ConstraintSelectorV2:
             return None
 
     def plot_single(self, gene):
+        """Plot a single gene effect vs drug response with correlation stats."""
         sns.set_context("notebook")
         plt.figure(figsize=(5, 5))
         x_plot = self.joined_df[gene].copy()
@@ -467,6 +491,7 @@ def get_constraints(
 
 
 def is_multidata(dataB):
+    """Check if a data batch is a list/tuple container."""
     return (isinstance(dataB, list)) or isinstance(dataB, tuple)
 
 
@@ -506,6 +531,13 @@ def unpack_data(dataB, device="cuda"):
 
 # https://stackoverflow.com/questions/14906764/how-to-redirect-stdout-to-both-file-and-console-with-scripting
 class Logger(object):
+    """
+    Simple stdout tee that writes to both terminal and a file.
+
+    Args:
+        filename: Path to the log file.
+        mode: File mode for the log file.
+    """
     def __init__(self, filename, mode="a"):
         self.terminal = sys.stdout
         self.log = open(filename, mode)
@@ -522,6 +554,12 @@ class Logger(object):
 
 
 class Timer:
+    """
+    Context manager that prints elapsed wall time on exit.
+
+    Args:
+        name: Label shown in the timing output.
+    """
     def __init__(self, name):
         self.name = name
 
@@ -543,6 +581,7 @@ class Timer:
 def plot_mut_wt_boxplot(
     df_eff, df_mut, gene_mut="TP53", gene_eff="TP53", pathway_genes=None
 ):
+    """Plot mutation vs wild-type effect distributions with optional pathway grouping."""
     df_eff_gene = df_eff[gene_eff]
     if pathway_genes is None:
         filt_muts = df_mut.loc[:, gene_mut].copy()
@@ -597,6 +636,7 @@ def plot_mut_wt_boxplot(
 
 
 def plot_by_cancer_lineage(data, genes):
+    """Plot per-lineage Pearson correlations for predicted vs observed values."""
     cancer_types = list(set(data["lineage"]))
     # Calculate correlations by type
     corrs = []
@@ -642,15 +682,18 @@ def plot_by_cancer_lineage(data, genes):
 
 
 def gene_column_renamer(name):
+    """Extract HGNC gene symbol from a composite column name."""
     return name.split(" ")[0]
 
 
 def gene_column_renamer_ncbi(name):
+    """Extract NCBI/Entrez ID from a name containing a trailing '(ID)'."""
     ncbi_id = name.split("(")[-1].split(")")[0]
     return ncbi_id
 
 
 def lineage_renamer(x):
+    """Normalize lineage strings by replacing spaces and slashes with underscores."""
     x = "_".join((x.split(" ")))
     return "_".join(x.split("/"))
 
@@ -736,6 +779,8 @@ class Manual(Dataset):
         self.s = self.s.rename(lambda x: f"{x.upper()}_s", axis=1)[
             [f"{constraint.upper()}_s" for constraint in constraints]
         ]
+
+        # print(self.y)
         if duration_event is None:
             if isinstance(target, list):
                 self.y = self.y.rename(lambda x: f"{x.upper()}_y", axis=1)[
@@ -746,10 +791,11 @@ class Manual(Dataset):
                     [f"{target.upper()}_y"]
                 ]
         else:
+            target_root = target.split("_")[0]
             self.y = self.y.rename(lambda x: f"{x.upper()}_y", axis=1)[
                 [
-                    f"{target.upper()}_{duration_event[0]}_y",
-                    f"{target.upper()}_{duration_event[1]}_y",
+                    f"{target_root.upper()}_{duration_event[0]}_y",
+                    f"{target_root.upper()}_{duration_event[1]}_y",
                 ]
             ]
 
@@ -768,17 +814,17 @@ class Manual(Dataset):
                 self.c = self.c.dropna(axis=0)
 
         # x should be of shape (num_samples, num_features)
-        if self.params["var_filt_x"] is not None:
-            x_var = np.nanvar(self.x, axis=0)
-            x_features = np.argwhere(x_var > self.params["var_filt_x"]).squeeze()
-            self.x = self.x.iloc[:, x_features]
+        # if self.params["var_filt_x"] is not None:
+        #     x_var = np.nanvar(self.x, axis=0)
+        #     x_features = np.argwhere(x_var > self.params["var_filt_x"]).squeeze()
+        #     self.x = self.x.iloc[:, x_features]
         self.x_features = self.x.columns.tolist()
         self.x_samples = self.x.index
         # s should be of shape (num_samples, num_constraints)
-        if self.params["var_filt_s"] is not None:
-            s_var = np.nanvar(s, axis=0)
-            s_features = np.argwhere(s_var > self.params["var_filt_s"]).squeeze()
-            self.s = self.s.iloc[:, s_features]
+        # if self.params["var_filt_s"] is not None:
+        #     s_var = np.nanvar(s, axis=0)
+        #     s_features = np.argwhere(s_var > self.params["var_filt_s"]).squeeze()
+        #     self.s = self.s.iloc[:, s_features]
         self.s_features = self.s.columns.tolist()
         self.s_samples = self.s.index
         # y should be of shape (num_samples, num_targets)
@@ -954,6 +1000,11 @@ class Manual(Dataset):
         self.x_s_idx = [self.sample_to_idx[x] for x in self.x_s_samples]
         self.x_only_idx = [self.sample_to_idx[x] for x in self.x_only_samples]
 
+        print(f"x_s_y: {len(self.x_s_y_idx)}")
+        print(f"x_y: {len(self.x_y_idx)}")
+        print(f"x_s: {len(self.x_s_idx)}")
+        print(f"x_only: {len(self.x_only_idx)}")
+
         if self.use_c:
             self.x_s_c_y_idx = [self.sample_to_idx[x] for x in self.x_s_c_y_samples]
             self.x_c_y_idx = [self.sample_to_idx[x] for x in self.x_c_y_samples]
@@ -973,26 +1024,12 @@ class Manual(Dataset):
                 print(f"{'c':<35}{self.c.shape}")
             print(f"{'-' * 50}")
 
-            print(f"\n{'Sample types:':<35}")
-            print(f"{'-' * 50}")
-            print(f"{'Sample type':<35}{'Num. samples'}")
-            print(f"{'-' * 50}")
-            print(f"{'x_s_y':<35}{len(self.x_s_y_samples)}")
-            print(f"{'x_y':<35}{len(self.x_y_samples)}")
-            print(f"{'x_s':<35}{len(self.x_s_samples)}")
-            print(f"{'x_only':<35}{len(self.x_only_samples)}")
-            if self.use_c:
-                print(f"{'x_s_c_y':<35}{len(self.x_s_c_y_samples)}")
-                print(f"{'x_c_y':<35}{len(self.x_c_y_samples)}")
-                print(f"{'x_s_c':<35}{len(self.x_s_c_samples)}")
-                print(f"{'x_c':<35}{len(self.x_c_samples)}")
-            print(f"{'-' * 50}")
-
         # Placeholder priors for s
         self.s_prior_loc = None
         self.s_prior_scale = None
 
     def mean_impute_x(self, train_idx):
+        """Impute missing values in x using column means from train_idx."""
         means = np.nanmean(self.x[train_idx], axis=0)
 
         # Find indices that you need to replace
@@ -1001,7 +1038,19 @@ class Manual(Dataset):
         # Place column means in the indices. Align the arrays using take
         self.x[inds] = np.take(means, inds[1])
 
+    def var_filter_x(self, train_idx):
+        """Variance-filter x columns using train_idx and update feature list."""
+        # Variance filter on x using training data only
+        variances = np.nanvar(self.x[train_idx], axis=0)
+        feature_inds = np.argsort(variances)[-self.params["var_filt_x"] :]
+        self.x = self.x[:, feature_inds]
+        self.x_features = [self.x_features[i] for i in feature_inds]
+        print(
+            f"[INFO] Number of features in x reduced to {self.x.shape[1]} after variance filtering"
+        )
+
     def mean_impute_s(self, train_idx):
+        """Impute missing values in s using column means from train_idx."""
         means = np.nanmean(self.s[train_idx], axis=0)
 
         # Find indices that you need to replace
@@ -1011,6 +1060,7 @@ class Manual(Dataset):
         self.s[inds] = np.take(means, inds[1])
 
     def pca_s(self, train_idx):
+        """Fit PCA on s (train_idx) and replace s with PCA scores."""
         # Scale all features
         scaler = StandardScaler()
         scaler = scaler.fit(self.s[train_idx])
@@ -1026,21 +1076,27 @@ class Manual(Dataset):
         self.s = s_pca
 
     def s_prior_fn_loc(self):
+        """Return the stored prior mean for s."""
         return self.s_prior_loc
 
     def s_prior_fn_scale(self):
+        """Return the stored prior scale for s."""
         return self.s_prior_scale
 
     def y_prior_fn_loc(self):
+        """Return the stored prior mean for y."""
         return self.y_prior_loc
 
     def y_prior_fn_scale(self):
+        """Return the stored prior scale for y."""
         return self.y_prior_scale
 
     def __len__(self):
+        """Return the number of samples."""
         return len(self.x)
 
     def __getitem__(self, idx):
+        """Return a single sample tuple (x, s, c, y, idx, st)."""
         if self.use_c:
             return (
                 self.x[idx],
@@ -1068,6 +1124,7 @@ def split_dataset(
     val_split=0.2,
     seed=4563,
     pretraining=None,
+    var_filter=True,
     verbose=False,
 ):
     """
@@ -1167,6 +1224,10 @@ def split_dataset(
 
     train_idx_i = train_idx_i1 + train_idx_i2
 
+    if var_filter:
+        # Use train_idx_i to do variance filtering on x
+        data.var_filter_x(train_idx_i)
+
     # Use train_idx_i to do mean imputation on all of x
     data.mean_impute_x(train_idx_i)
 
@@ -1190,11 +1251,17 @@ def split_dataset(
     # Split samples with x and y using KFold
     kf_p2 = KFold(n_splits=k, random_state=seed, shuffle=True)
     # Randomly split samples with x and y
-    for i, (fold_train_idx, fold_val_idx) in enumerate(kf_p2.split(train_val_idx_p2)):
-        if i == fold:
-            train_idx_p2 = [train_val_idx_p2[j] for j in fold_train_idx]
-            val_idx_p = [train_val_idx_p2[j] for j in fold_val_idx]
-            break
+    if len(train_val_idx_p2) > 0:
+        for i, (fold_train_idx, fold_val_idx) in enumerate(
+            kf_p2.split(train_val_idx_p2)
+        ):
+            if i == fold:
+                train_idx_p2 = [train_val_idx_p2[j] for j in fold_train_idx]
+                val_idx_p = [train_val_idx_p2[j] for j in fold_val_idx]
+                break
+    else:
+        train_idx_p2 = []
+        val_idx_p = []
 
     train_idx_p = train_idx_p1 + train_idx_p2
 
@@ -1253,13 +1320,8 @@ def split_dataset(
 
 
 def process_depmap_gdsc(wd_path, experiment, **kwargs):
+    """Load (and download if needed) DepMap + GDSC data and select test samples."""
     # DOWNLOADING DATA
-    if not os.path.exists(f"{wd_path}/data"):
-        os.makedirs(f"{wd_path}/data")
-    if not os.path.exists(f"{wd_path}/data/depmap23q2"):
-        os.makedirs(f"{wd_path}/data/depmap23q2")
-    if not os.path.exists(f"{wd_path}/data/gdsc"):
-        os.makedirs(f"{wd_path}/data/gdsc")
     # If data not present in specified folders, download it
     if not os.path.exists(f"{wd_path}/data/depmap23q2/CRISPRGeneEffect.csv"):
         urllib.request.urlretrieve(
@@ -1297,11 +1359,6 @@ def process_depmap_gdsc(wd_path, experiment, **kwargs):
             "https://figshare.com/ndownloader/files/40448837",
             f"{wd_path}/data/depmap23q2/ModelCondition.csv",
         )
-    if not os.path.exists(f"{wd_path}/data/depmap23q2/AchillesScreenQCReport.csv"):
-        urllib.request.urlretrieve(
-            "https://figshare.com/ndownloader/files/40448441",
-            f"{wd_path}/data/depmap23q2/AchillesScreenQCReport.csv",
-        )
     if not os.path.exists(
         f"{wd_path}/data/gdsc/GDSC2_fitted_dose_response_27Oct23.xlsx"
     ):
@@ -1324,8 +1381,8 @@ def process_depmap_gdsc(wd_path, experiment, **kwargs):
     eff = pd.read_csv(f"{wd_path}/data/depmap23q2/CRISPRGeneEffect.csv", index_col=0)
     # Also include confounders in eff
     # See how this is processed for crisprconverter
-    # conf = pd.read_csv(f"{wd_path}/data/depmap23q2/AchillesScreenQCReport.csv")
-    # conf = conf[conf["Library"] == "Avana"].groupby("ModelID").mean()
+    conf = pd.read_csv(f"{wd_path}/data/depmap23q2/AchillesScreenQCReport.csv")
+    conf = conf[conf["Library"] == "Avana"].groupby("ModelID").mean()
     # eff = pd.merge(eff, conf, left_index=True, right_index=True, how="outer")
 
     # Load GDSC (indexed by COSMICID)
@@ -1393,15 +1450,8 @@ def process_depmap_gdsc(wd_path, experiment, **kwargs):
 
 
 def process_depmap_gdsc_transneo(wd_path, experiment, **kwargs):
+    """Load DepMap + TransNEO data, align features, and select test samples."""
     # DOWNLOADING DATA
-    if not os.path.exists(f"{wd_path}/data"):
-        os.makedirs(f"{wd_path}/data")
-    if not os.path.exists(f"{wd_path}/data/depmap23q2"):
-        os.makedirs(f"{wd_path}/data/depmap23q2")
-    if not os.path.exists(f"{wd_path}/data/gdsc"):
-        os.makedirs(f"{wd_path}/data/gdsc")
-    if not os.path.exists(f"{wd_path}/data/transneo"):
-        os.makedirs(f"{wd_path}/data/transneo")
     # If data not present in specified folders, download it
     if not os.path.exists(f"{wd_path}/data/depmap23q2/CRISPRGeneEffect.csv"):
         urllib.request.urlretrieve(
@@ -1426,6 +1476,12 @@ def process_depmap_gdsc_transneo(wd_path, experiment, **kwargs):
         urllib.request.urlretrieve(
             "https://cog.sanger.ac.uk/cancerrxgene/GDSC_release8.5/GDSC2_fitted_dose_response_27Oct23.xlsx",
             f"{wd_path}/data/gdsc/GDSC2_fitted_dose_response_27Oct23.xlsx",
+        )
+    # Download L1000 gene list
+    if not os.path.exists(f"{wd_path}/data/transneo/lincs_l1000_genes.txt"):
+        urllib.request.urlretrieve(
+            "https://s3.amazonaws.com/macchiato.clue.io/builds/LINCS2020/geneinfo_beta.txt?AWSAccessKeyId=AKIATAWTSI6KFUAMHHXN&Expires=1764619768&Signature=GE7TNTgkkQ3mWuOU7mnZbsmTW7I%3D",
+            f"{wd_path}/data/transneo/lincs_l1000_genes.txt",
         )
 
     # LOADING DATA
@@ -1501,14 +1557,30 @@ def process_depmap_gdsc_transneo(wd_path, experiment, **kwargs):
     # TEST SAMPLE SELECTION/EXPERIMENT DEFINITION
     if experiment == "artemis_pbcp":
         test_samples = sorted(list(set(exp_transneo_val.index.tolist())))
+    elif experiment == "tnbc":
+        test_samples = transneo_features[
+            (transneo_features["ER.status"] == 0)
+            & (transneo_features["HER2.status"] == 0)
+        ].index.tolist()
     else:
-        ValueError("Unrecognised experiment. Please use artemis_pbcp.")
+        ValueError("Unrecognised experiment. Please use artemis_pbcp or tnbc.")
 
     # Concatenate all expression data and filter for shared genes
     shared_cols = sorted(
         list(set(exp_transneo.columns).intersection(set(exp_depmap.columns)))
     )
     print(f"Number of shared features in x: {len(shared_cols)}")
+
+    # We prefilter genes here to LINCS L1000 to reduce dimensionality and avoid a very biased variance filter
+    lincs_genes = pd.read_csv(
+        f"{wd_path}/data/transneo/lincs_l1000_genes.txt", header=0, sep="\t"
+    )[["ensembl_id", "feature_space"]]
+    lincs_genes = lincs_genes[lincs_genes["feature_space"] == "landmark"][
+        "ensembl_id"
+    ].values
+    shared_cols = [gene for gene in lincs_genes if gene in shared_cols]
+    print(f"Number of LINCS L1000 genes in shared features: {len(shared_cols)}")
+
     exp_transneo = exp_transneo.loc[:, shared_cols]
     exp_transneo_val = exp_transneo_val.loc[:, shared_cols]
     exp_depmap = exp_depmap.loc[:, shared_cols]
@@ -1517,479 +1589,13 @@ def process_depmap_gdsc_transneo(wd_path, experiment, **kwargs):
     exp = pd.concat([exp_depmap, exp_transneo, exp_transneo_val], axis=0)
 
     # Concatenate GDSC response and DepMap effect, concatenate by feature, so pd.merge
-    eff_gdsc = pd.merge(eff, gdsc, right_index=True, left_index=True)
+    eff_gdsc = pd.merge(eff, gdsc, right_index=True, left_index=True, how="outer")
 
     return exp, eff_gdsc, transneo_features, transneo_response, test_samples
 
 
-def process_depmap_gdsc_scanb_tcga(wd_path, experiment, **kwargs):
-    # DOWNLOADING DATA
-    if not os.path.exists(f"{wd_path}/data"):
-        os.makedirs(f"{wd_path}/data")
-    if not os.path.exists(f"{wd_path}/data/depmap23q2"):
-        os.makedirs(f"{wd_path}/data/depmap23q2")
-    if not os.path.exists(f"{wd_path}/data/gdsc"):
-        os.makedirs(f"{wd_path}/data/gdsc")
-    if not os.path.exists(f"{wd_path}/data/scanb"):
-        os.makedirs(f"{wd_path}/data/scanb")
-    if not os.path.exists(f"{wd_path}/data/tcga"):
-        os.makedirs(f"{wd_path}/data/tcga")
-    # If data not present in specified folders, download it
-    if not os.path.exists(f"{wd_path}/data/depmap23q2/CRISPRGeneEffect.csv"):
-        urllib.request.urlretrieve(
-            "https://figshare.com/ndownloader/files/40448555",
-            f"{wd_path}/data/depmap23q2/CRISPRGeneEffect.csv",
-        )
-    if not os.path.exists(
-        f"{wd_path}/data/depmap23q2/OmicsExpressionProteinCodingGenesTPMLogp1.csv"
-    ):
-        urllib.request.urlretrieve(
-            "https://figshare.com/ndownloader/files/40449128",
-            f"{wd_path}/data/depmap23q2/OmicsExpressionProteinCodingGenesTPMLogp1.csv",
-        )
-    if not os.path.exists(f"{wd_path}/data/depmap23q2/Model.csv"):
-        urllib.request.urlretrieve(
-            "https://figshare.com/ndownloader/files/40448834",
-            f"{wd_path}/data/depmap23q2/Model.csv",
-        )
-    if not os.path.exists(
-        f"{wd_path}/data/gdsc/GDSC2_fitted_dose_response_27Oct23.xlsx"
-    ):
-        urllib.request.urlretrieve(
-            "https://cog.sanger.ac.uk/cancerrxgene/GDSC_release8.5/GDSC2_fitted_dose_response_27Oct23.xlsx",
-            f"{wd_path}/data/gdsc/GDSC2_fitted_dose_response_27Oct23.xlsx",
-        )
-    if not os.path.exists(f"{wd_path}/data/scanb/SCANB.9206.genematrix_noNeg.txt"):
-        urllib.request.urlretrieve(
-            "https://prod-dcd-datasets-public-files-eu-west-1.s3.eu-west-1.amazonaws.com/636d1022-a752-4669-ab5c-2c9cbd7b60e2",
-            f"{wd_path}/data/scanb/SCANB.9206.genematrix_noNeg.txt",
-        )
-    if not os.path.exists(f"{wd_path}/data/scanb/SCANB.9206.mymatrix.txt"):
-        urllib.request.urlretrieve(
-            "https://prod-dcd-datasets-public-files-eu-west-1.s3.eu-west-1.amazonaws.com/ec33b479-b050-4718-a199-2857375778a0",
-            f"{wd_path}/data/scanb/SCANB.9206.mymatrix.txt",
-        )
-        urllib.request.urlretrieve(
-            "https://prod-dcd-datasets-public-files-eu-west-1.s3.eu-west-1.amazonaws.com/0b31d7f7-2d41-41e0-9fa2-f7780aff3ea5",
-            f"{wd_path}/data/scanb/scanb_metadata.xlsx",
-        )
-    # Download TCGA breast
-    if not os.path.exists(f"{wd_path}/data/tcga/brca_tcga_gdc.tar.gz"):
-        urllib.request.urlretrieve(
-            "https://cbioportal-datahub.s3.amazonaws.com/brca_tcga_gdc.tar.gz",
-            f"{wd_path}/data/tcga/brca_tcga_gdc.tar.gz",
-        )
-        extract_all(
-            [f"{wd_path}/data/tcga/brca_tcga_gdc.tar.gz"], f"{wd_path}/data/tcga"
-        )
-    if not os.path.exists(f"{wd_path}/data/tcga/brca_tcga.tar.gz"):
-        urllib.request.urlretrieve(
-            "https://cbioportal-datahub.s3.amazonaws.com/brca_tcga.tar.gz",
-            f"{wd_path}/data/tcga/brca_tcga.tar.gz",
-        )
-        extract_all([f"{wd_path}/data/tcga/brca_tcga.tar.gz"], f"{wd_path}/data/tcga")
-
-    # LOADING DATA
-    # Load gene expression (indexed by DepMapID)
-    exp_depmap = pd.read_csv(
-        f"{wd_path}/data/depmap23q2/OmicsExpressionProteinCodingGenesTPMLogp1.csv",
-        index_col=0,
-    )
-    y_scanb = None
-    y_tcga = None
-
-    ncbi_to_ensg = pd.read_csv(f"{wd_path}/data/transneo/biomart_ncbi_to_ensg.csv")
-
-    ncbi_to_ensg = ncbi_to_ensg[
-        ~ncbi_to_ensg["NCBI gene (formerly Entrezgene) ID"].isna()
-    ]
-    # Load SCANB expression
-    # Load mutations
-    # mut_df = pd.read_csv(
-    #             f"{wd_path}/scanb_muts.tsv", sep="\t", skiprows=range(19)
-    #         )
-    #         mut_df_mat = mut_df[~(mut_df["SnpEff.Effect.Class"] == "Synonymous")]
-    #         mut_df_mat["mut"] = 1
-    #         mut_df_mat = mut_df_mat.pivot_table(
-    #             values="mut", index="SAMPLE", columns="gene.symbol", fill_value=0
-    #         )
-
-    # Load processed expression file if it exists, otherwise make
-    if os.path.exists(f"{wd_path}/data/scanb/scanb_exp_all.csv"):
-        exp_tpm_scanb_all = pd.read_csv(
-            f"{wd_path}/data/scanb/scanb_exp_all.csv"
-        ).set_index("Unnamed: 0")
-        meta_scanb = pd.read_excel(f"{wd_path}/data/scanb/scanb_metadata.xlsx")
-        # Follow up cohort only
-        meta_scanb = meta_scanb[meta_scanb["Follow.up.cohort"]].set_index("GEX.assay")
-        meta_scanb = meta_scanb.rename(mapper=scanb_row_renamer, axis=0)
-    else:
-        # Load SCANB expression and metadata (unadjusted)
-        exp_scanb = pd.read_csv(
-            f"{wd_path}/data/scanb/SCANB.9206.genematrix_noNeg.txt",
-            sep="\t",
-            index_col=0,
-        )
-
-        # Drop any PAR_Y genes
-        exp_scanb = exp_scanb[~exp_scanb.index.str.endswith("Y")]
-
-        meta_scanb = pd.read_excel(f"{wd_path}/data/scanb/scanb_metadata.xlsx")
-
-        # Follow up cohort only
-        meta_scanb = meta_scanb[meta_scanb["Follow.up.cohort"]].set_index("GEX.assay")
-
-        exp_scanb = exp_scanb.sort_index().transpose().astype(np.float32)
-
-        # SCAN-B is in FPKM
-        # convert scanb from FPKM to TPM, then to log2(TPM+1)
-        exp_tpm_scanb = exp_scanb.div(exp_scanb.sum(axis=1), axis=0) * 1e6
-        exp_tpm_scanb = exp_tpm_scanb.transform(lambda x: np.log2(x + 1))
-
-        # Converted expression matrix for all samples
-        exp_tpm_scanb_all = exp_tpm_scanb.loc[
-            exp_tpm_scanb.index.isin(meta_scanb.index)
-        ]
-
-        # Now rename both matrices
-        exp_tpm_scanb_all = exp_tpm_scanb_all.rename(mapper=scanb_row_renamer, axis=0)
-        meta_scanb = meta_scanb.rename(mapper=scanb_row_renamer, axis=0)
-        # Renames gene names to match others
-        exp_tpm_scanb_all = exp_tpm_scanb_all.rename(mapper=ensg_column_renamer, axis=1)
-        # Drop any all NA columns
-        exp_tpm_scanb_all = exp_tpm_scanb_all.dropna(axis=1, how="all")
-        # Take mean of duplicate columns
-        exp_tpm_scanb_all = (
-            exp_tpm_scanb_all.transpose()
-            .reset_index()
-            .groupby("index")
-            .mean()
-            .transpose()
-        )
-
-        # Save result for later use
-        exp_tpm_scanb_all.to_csv(f"{wd_path}/data/scanb/scanb_exp_all.csv")
-
-    # Get TCGA survival data
-    meta_tcga = pd.read_csv(
-        f"{wd_path}/data/tcga/brca_tcga/data_clinical_patient.txt", sep="\t", header=4
-    )
-    # No patient with prior treatment for TCGA
-    meta_tcga = meta_tcga[meta_tcga["HISTORY_OTHER_MALIGNANCY"] == "No"].set_index(
-        "PATIENT_ID"
-    )
-
-    # Get TCGA sample data -- remove metastatic samples
-    meta_tcga_sample = pd.read_csv(
-        f"{wd_path}/data/tcga/brca_tcga/data_clinical_sample.txt", sep="\t", header=4
-    )
-    meta_tcga_sample = meta_tcga_sample[
-        meta_tcga_sample["SAMPLE_TYPE"] == "Primary"
-    ].set_index("SAMPLE_ID")
-
-    if os.path.exists(f"{wd_path}/data/tcga/tcga_exp_all.csv"):
-        exp_tcga = pd.read_csv(f"{wd_path}/data/tcga/tcga_exp_all.csv", index_col=0)
-    else:
-        # Load TCGA expression
-        exp_tcga = pd.read_csv(
-            f"{wd_path}/data/tcga/brca_tcga_gdc/data_mrna_seq_tpm.txt",
-            sep="\t",
-            index_col=0,
-        ).transpose()
-        # Convert to log2(TPM+1)
-        exp_tcga = exp_tcga.transform(lambda x: np.log2(x + 1))
-
-        ncbi_to_ensg_map_tcga = {
-            int(row["NCBI gene (formerly Entrezgene) ID"]): row["Gene stable ID"]
-            for ind, row in ncbi_to_ensg.iterrows()
-        }
-
-        # Do the same for TCGA (Entrez gene ID by default)
-        exp_tcga = exp_tcga.rename(mapper=ncbi_to_ensg_map_tcga, axis=1)
-        exp_tcga = (
-            exp_tcga.transpose()
-            .reset_index()
-            .groupby("Entrez_Gene_Id")
-            .mean()
-            .transpose()
-        )
-
-        # Select only primary tumour samples
-        exp_tcga = exp_tcga[exp_tcga.index.isin(meta_tcga_sample.index)]
-
-        # Convert sample names to patiet names now we removed metastatic samples
-        exp_tcga = exp_tcga.rename(lambda x: "-".join(x.split("-")[:-1]), axis=0)
-
-        # Save result for later use
-        exp_tcga.to_csv(f"{wd_path}/data/tcga/tcga_exp_all.csv")
-
-    # Load sample details (contains COSMICID to DepMapID map)
-    model = pd.read_csv(f"{wd_path}/data/depmap23q2/Model.csv", index_col=0)
-    # Load gene effect data (indexed by DepMapID)
-    eff = pd.read_csv(f"{wd_path}/data/depmap23q2/CRISPRGeneEffect.csv", index_col=0)
-
-    # Load GDSC (indexed by COSMICID)
-    gdsc_scores = pd.read_excel(
-        f"{wd_path}/data/gdsc/GDSC2_fitted_dose_response_27Oct23.xlsx"
-    )
-    gdsc = gdsc_scores.pivot_table(
-        index="COSMIC_ID", columns="DRUG_NAME", values="LN_IC50"
-    )
-
-    # Rename columns to be HGNC name for knockouts
-    eff = eff.rename(mapper=gene_column_renamer, axis=1)
-    # Rename columns to be Entrez/NCBI ID for expression
-    exp_depmap = exp_depmap.rename(mapper=gene_column_renamer_ncbi, axis=1)
-    # Map columns to ENSG from NCBI
-    ncbi_to_ensg_map = {
-        str(int(row["NCBI gene (formerly Entrezgene) ID"])): row["Gene stable ID"]
-        for ind, row in ncbi_to_ensg.iterrows()
-    }
-    exp_depmap = exp_depmap.rename(mapper=ncbi_to_ensg_map, axis=1)
-    # Deal with duplicate genes by taking mean
-    exp_depmap = (
-        exp_depmap.transpose().reset_index().groupby("index").mean().transpose()
-    )
-
-    # Make mapping from COSMICID to DepMapID
-    cosmic_to_depmapid = model["COSMICID"].reset_index()
-    cosmic_to_depmapid = {row["COSMICID"]: row.name for i, row in model.iterrows()}
-
-    # Map GDSC samples to DepMap_ID, leave COSMICID if not present
-    gdsc = gdsc.rename(cosmic_to_depmapid, axis=0)
-    # Convert all columns to upper case and take target.upper()
-    gdsc = gdsc.rename(lambda x: x.upper(), axis=1)
-
-    # TEST SAMPLE SELECTION/EXPERIMENT DEFINITION
-    if experiment is None:
-        test_samples = []
-    elif experiment == "tcga":
-        test_samples = exp_tcga.index.tolist()
-    else:
-        ValueError("No experiments implemented for this dataset.")
-
-    # Concatenate all expression data and filter for shared genes
-    shared_cols = sorted(
-        list(
-            set(exp_tpm_scanb_all.columns)
-            .intersection(set(exp_depmap.columns))
-            .intersection(set(exp_tcga.columns))
-        )
-    )
-    print(f"Number of shared features in x: {len(shared_cols)}")
-    exp_tpm_scanb_all = exp_tpm_scanb_all.loc[:, shared_cols]
-    exp_depmap = exp_depmap.loc[:, shared_cols]
-    exp_tcga = exp_tcga.loc[:, shared_cols]
-
-    # Concatenate by samples, all should have same columns
-    exp = pd.concat([exp_depmap, exp_tpm_scanb_all, exp_tcga], axis=0)
-
-    # Concatenate GDSC response and DepMap effect, concatenate by feature, so pd.merge
-    eff_gdsc = pd.merge(eff, gdsc, right_index=True, left_index=True)
-
-    # Processing SCANB clinical and survival
-
-    t_timepoints = [1, 3, 5]
-    # SCANB BCFi is equivalent to TCGA DFS
-    scanb_events = ["BCFi", "OS", "RFi", "DRFi"]
-    tcga_events = ["OS", "DFS"]
-    event_map = {"DFS": "BCFi", "OS": "OS"}
-
-    # Convert SCANB data to months for survival
-    scanb_t_sfx = "days"
-    scanb_e_sfx = "event"
-    scanb_k = 365
-
-    tcga_t_sfx = "MONTHS"
-    tcga_e_sfx = "STATUS"
-    tcga_k = 12
-
-    # Process SCAN-B clinical features
-    meta_scanb["HER2"] = meta_scanb["HER2"].map({"Positive": 1, "Negative": 0})
-    meta_scanb["ER"] = meta_scanb["ER"].map({"Positive": 1, "Negative": 0})
-    meta_scanb["PR"] = meta_scanb["PR"].map({"Positive": 1, "Negative": 0})
-    meta_scanb["SIZE"] = meta_scanb["T.size"]
-    # Remap age and grade covariates
-    meta_scanb["AGE"] = meta_scanb[
-        "Age (5-year range, e.g., 35(31-35), 40(36-40), 45(41-45) etc.)"
-    ].astype(np.float32)
-    meta_scanb = meta_scanb.drop(
-        "Age (5-year range, e.g., 35(31-35), 40(36-40), 45(41-45) etc.)",
-        axis=1,
-    )
-
-    meta_scanb["GRADE"] = meta_scanb["NHG"]
-    meta_scanb = meta_scanb.drop("NHG", axis=1)
-
-    # Process TCGA clinical features
-    meta_tcga["AGE"] = (
-        meta_tcga["AGE"].replace({"[Not Available]": np.nan}).astype(np.float32)
-    )
-    meta_tcga["ER"] = meta_tcga["ER_STATUS_BY_IHC"].map(
-        {"Positive": 1, "Negative": 0, "Indeterminate": 0, "[Not Available]": np.nan}
-    )
-    meta_tcga["PR"] = meta_tcga["PR_STATUS_BY_IHC"].map(
-        {"Positive": 1, "Negative": 0, "Indeterminate": 0, "[Not Available]": np.nan}
-    )
-    # Get HER2 by IHC
-    meta_tcga["HER2"] = meta_tcga["IHC_HER2"].map(
-        {
-            "Positive": 1,
-            "Negative": 0,
-            "Indeterminate": 0,
-            "Equivocal": 0,
-            "[Not Available]": np.nan,
-        }
-    )
-    meta_tcga["HER2_FISH_STATUS"] = meta_tcga["HER2_FISH_STATUS"].map(
-        {
-            "Positive": 1,
-            "Negative": 0,
-            "Indeterminate": 0,
-            "Equivocal": 0,
-            "[Not Available]": np.nan,
-        }
-    )
-    # If HER2 by IHC is equivocal, check for FISH status
-    meta_tcga["HER2"] = meta_tcga[["HER2_FISH_STATUS", "HER2"]].max(axis=1)
-    # Get lymph node status column.Assume that NA is when no lymph nodes dissected.
-    meta_tcga["LN"] = (
-        meta_tcga["LYMPH_NODES_EXAMINED_HE_COUNT"]
-        .replace({"[Not Available]": 0})
-        .astype(np.float32)
-        .clip(lower=0, upper=1)
-    )
-    # Map a size variables using AJCC PT. Anything T2 is marked 1. Shared variable for size in SCAN-B since size in mm not available in TCGA
-    meta_tcga["SIZE"] = meta_tcga["AJCC_TUMOR_PATHOLOGIC_PT"].map(
-        {
-            "Tis": 0,
-            "T1a": 0,
-            "T1b": 0,
-            "T1c": 0,
-            "T2": 1,
-            "T3": 1,
-            "T4": 1,
-            "T2a": 1,
-            "T3a": 1,
-            "[Not Available]": np.nan,
-        }
-    )
-
-    # Creating targets for SCANB
-    for event in scanb_events:
-        # Make months column for scanb events
-        meta_scanb.loc[:, f"{event}_{tcga_t_sfx}"] = meta_scanb[
-            f"{event}_{scanb_t_sfx}"
-        ] * (tcga_k / scanb_k)
-        meta_scanb.loc[:, f"{event}_{tcga_e_sfx}"] = meta_scanb[
-            f"{event}_{scanb_e_sfx}"
-        ]
-        for timepoint in t_timepoints:
-            meta_scanb.loc[:, f"{event}_{timepoint}Y"] = (
-                meta_scanb[f"{event}_{scanb_t_sfx}"] < (scanb_k * timepoint)
-            ) & (meta_scanb[f"{event}_{scanb_e_sfx}"] == 1)
-            # Remove censored patients for binary classification, these samples can go in unsupervised samples for x
-            # 5Y survival should be NA if patient does not have follow up this long
-            # If time less than timepoint and event is zero, then set to NA
-            meta_scanb_cens = meta_scanb[
-                (meta_scanb[f"{event}_{scanb_t_sfx}"] < (scanb_k * timepoint))
-                & (meta_scanb[f"{event}_{scanb_e_sfx}"] == 0)
-            ]
-            meta_scanb.loc[meta_scanb_cens.index, f"{event}_{timepoint}Y"] = np.nan
-        if y_scanb is None:
-            y_scanb = meta_scanb[
-                [
-                    f"{event}_{timepoint}Y",
-                    f"{event}_{tcga_e_sfx}",
-                    f"{event}_{tcga_t_sfx}",
-                ]
-            ]
-        else:
-            y_scanb.loc[:, f"{event}_{timepoint}Y"] = meta_scanb[
-                f"{event}_{timepoint}Y"
-            ]
-
-    # Creating targets for TCGA
-    for event in tcga_events:
-        # Format the event column
-        meta_tcga[f"{event}_{tcga_e_sfx}"] = (
-            meta_tcga[f"{event}_{tcga_e_sfx}"]
-            .replace({"[Not Available]": np.nan})
-            .apply(lambda x: int(x.split(":")[0]) if type(x) is str else x)
-        )
-        meta_tcga[f"{event}_{tcga_t_sfx}"] = (
-            meta_tcga[f"{event}_{tcga_t_sfx}"]
-            .replace({"[Not Available]": np.nan})
-            .astype(np.float32)
-        )
-        # Create columns in SCANB format
-        meta_tcga.loc[:, f"{event_map[event]}_{tcga_t_sfx}"] = meta_tcga[
-            f"{event}_{tcga_t_sfx}"
-        ]
-        meta_tcga.loc[:, f"{event_map[event]}_{tcga_e_sfx}"] = meta_tcga[
-            f"{event}_{tcga_e_sfx}"
-        ]
-        for timepoint in t_timepoints:
-            meta_tcga[f"{event_map[event]}_{timepoint}Y"] = (
-                meta_tcga[f"{event}_{tcga_t_sfx}"] < (tcga_k * timepoint)
-            ) & (meta_tcga[f"{event}_{tcga_e_sfx}"] == 1)
-            # Remove censored patients for binary classification, these samples can go in unsupervised samples for x
-            # 5Y survival should be NA if patient does not have follow up this long
-            # If time less than timepoint and event is zero, then set to NA
-            meta_tcga_cens = meta_tcga[
-                (meta_tcga[f"{event}_{tcga_t_sfx}"] < (tcga_k * timepoint))
-                & (meta_tcga[f"{event}_{tcga_e_sfx}"] == 0)
-            ]
-            meta_tcga.loc[meta_tcga_cens.index, f"{event_map[event]}_{timepoint}Y"] = (
-                np.nan
-            )
-
-        if y_tcga is None:
-            y_tcga = meta_tcga[
-                [
-                    f"{event_map[event]}_{timepoint}Y",
-                    f"{event_map[event]}_{tcga_e_sfx}",
-                    f"{event_map[event]}_{tcga_t_sfx}",
-                ]
-            ]
-        else:
-            y_tcga.loc[:, f"{event_map[event]}_{timepoint}Y"] = meta_tcga[
-                f"{event_map[event]}_{timepoint}Y"
-            ]
-            y_tcga.loc[:, f"{event_map[event]}_{tcga_e_sfx}"] = meta_tcga[
-                f"{event_map[event]}_{tcga_e_sfx}"
-            ]
-            y_tcga.loc[:, f"{event_map[event]}_{tcga_t_sfx}"] = meta_tcga[
-                f"{event_map[event]}_{tcga_t_sfx}"
-            ]
-
-    y = pd.concat([y_scanb, y_tcga], axis=0)
-
-    # Merge metadata -- shared columns are age ER and HER2
-    meta_scanb_tcga = pd.concat(
-        [
-            meta_scanb[["AGE", "ER", "HER2", "LN", "SIZE"]],
-            meta_tcga[["AGE", "ER", "HER2", "LN", "SIZE"]],
-        ],
-        axis=0,
-    ).dropna()
-
-    # c needs to be available for all samples with y so filter by indices with c
-    y = y.loc[meta_scanb_tcga.index]
-    drop_samples = [
-        test_sample for test_sample in test_samples if test_sample not in y.index
-    ]
-    test_samples = [
-        test_sample for test_sample in test_samples if test_sample in y.index
-    ]
-    # Drop any samples not used for testing from x to make sure samples from TCGA don't go in the training set
-    exp = exp.drop(drop_samples, axis=0)
-    # There may be SCAN-B samples with label = na in the x_unsup samples in iCoVAE and VAE
-
-    return exp, eff_gdsc, meta_scanb_tcga, y, test_samples
-
-
 def process_depmap_ctrp(wd_path, experiment, **kwargs):
+    """Load (and download if needed) DepMap + CTRP data and select test samples."""
     # DOWNLOADING DATA
     # If data not present in specified folders, download it
     if not os.path.exists(f"{wd_path}/data/depmap23q2/CRISPRGeneEffect.csv"):
@@ -2154,6 +1760,7 @@ def process_depmap_ctrp(wd_path, experiment, **kwargs):
 
 
 def process_data(dataset, wd_path, experiment, **kwargs):
+    """Dispatch to the appropriate dataset loader based on `dataset` name."""
     if dataset == "depmap_gdsc":
         x, s, c, y, test_samples = process_depmap_gdsc(wd_path, experiment, **kwargs)
     elif dataset == "depmap_gdsc_transneo":
@@ -2162,10 +1769,6 @@ def process_data(dataset, wd_path, experiment, **kwargs):
         )
     elif dataset == "depmap_ctrp":
         x, s, c, y, test_samples = process_depmap_ctrp(wd_path, experiment, **kwargs)
-    elif dataset == "depmap_gdsc_scanb_tcga":
-        x, s, c, y, test_samples = process_depmap_gdsc_scanb_tcga(
-            wd_path, experiment, **kwargs
-        )
     else:
         raise ValueError(
             "Unrecoginised dataset. Please choose from: depmap_gdsc, depmap_gdsc_transneo, depmap_ctrp, depmap_gdsc_scanb_tcga"
@@ -2186,6 +1789,7 @@ def get_data_loaders(
     verbose: bool = False,
     **kwargs,
 ):
+    """Build DataLoader objects for iCoVAE/PiCo stages with optional HPO settings."""
     if "num_workers" not in kwargs:
         kwargs = {"num_workers": 4, "pin_memory": True}
 

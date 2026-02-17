@@ -1,5 +1,8 @@
 #!/bin/bash
 #!
+#! SLURM job for SAE (test)  for Wilkes3 (AMD EPYC 7763, ConnectX-6, A100)
+#! Last updated: Thu 14 Apr 2022
+#!
 
 #!#############################################################
 #!#### Modify the options in this section as appropriate ######
@@ -9,7 +12,7 @@
 #! Name of the job:
 #SBATCH -J dk538-icovae
 #! Which project should be charged (NB Wilkes2 projects end in '-GPU'):
-#SBATCH -A YOUR-PROJECT-NAME-HERE
+#SBATCH -A MRC-BSU-SL2-GPU
 #! How many whole nodes should be allocated?
 #SBATCH --nodes=1
 #! How many (MPI) tasks will there be in total?
@@ -19,7 +22,7 @@
 #! Note that the job submission script will enforce no more than 32 cpus per GPU.
 #SBATCH --gres=gpu:1
 #! How much wallclock time will be required?
-#SBATCH --time=02:00:00
+#SBATCH --time=06:00:00
 #! What types of email messages do you wish to receive?
 #SBATCH --mail-type=begin
 #SBATCH --mail-type=end
@@ -58,12 +61,13 @@ module load cuda/11.8 cudnn/8.9_cuda-11.8 hdf5/1.8.2
 conda activate slurm-torch-2
 
 #! Full path to application executable: 
-application="python -u ./src/scripts/icovae_hopt.py"
+application="python -u ./scripts/icovae_hopt.py"
 
 #! Run options for the application:
-#options="-dataset depmap_gdsc_transneo -target RCB.score -constraints MCL1 PSMC1 FANCF RAD1 PPM1D SMU1 HSPA14 GBF1 MDM4 KNTC1 LRWD1 CEP97 ERBB2 ERBB3 EGFR PIK3CA --cuda --experiment artemis_pbcp"
-#options="-dataset depmap_gdsc_scanb_tcga -target BCFi -constraints MCL1 PSMC1 FANCF RAD1 PPM1D SMU1 HSPA14 GBF1 MDM4 KNTC1 LRWD1 CEP97 ERBB2 ERBB3 EGFR PIK3CA --cuda --experiment tcga"
-options="-dataset depmap_gdsc -target OXALIPLATIN -constraints general --cuda --experiment h16"
+#options="-dataset depmap_gdsc_transneo -target RCB.score -constraints MCL1 PSMC1 FANCF RAD1 PPM1D ESR1 ERBB2 CDKN2A TP53 IGF1R FGFR2 CCNE1 PIK3CA GATA3 MAP3K1 EGFR --cuda --experiment tnbc"
+#options="-dataset sim1 -target y_0 -constraints s_0 s_1 s_2 s_3 s_4 s_5 s_6 s_7 s_8 s_9 s_10 s_11 s_12 s_13 s_14 s_15 --cuda --experiment none --newstudy"
+#options="-dataset depmap_gdsc_scanb_tcga -target BCFi_5Y -constraints MCL1 PSMC1 FANCF RAD1 PPM1D ESR1 ERBB2 CDKN2A TP53 IGF1R FGFR2 CCNE1 PIK3CA GATA3 MAP3K1 EGFR --confounders AGE ER HER2 LN SIZE --cuda --experiment tcga_5y"
+options="-dataset depmap_gdsc -target AZD5153 --cuda --experiment h16 --test --newstudy"
 
 #! Work directory (i.e. where the job will run):
 workdir="$SLURM_SUBMIT_DIR"  # The value of SLURM_SUBMIT_DIR sets workdir to the directory

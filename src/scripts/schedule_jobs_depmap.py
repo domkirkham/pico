@@ -38,12 +38,12 @@ def submission_pico_sk_gdsc(
         constraints_str = " ".join(constraints)
 
     submission_preamble = rf"""#!/bin/bash
-#SBATCH -J dk538-pico
-#SBATCH -A your-project-name
+#SBATCH -J dk538-ssvae
+#SBATCH -A MRC-BSU2-SL2-CPU
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time={walltime}
-#SBATCH --output=path_to_dir/%j.out
+#SBATCH --output=/home/dk538/rds/hpc-work/graphdep/slurm_out/pico_hopt/%j.out
 #SBATCH --no-requeue
 #SBATCH -p icelake
 
@@ -106,20 +106,21 @@ eval $CMD"""
 
 
 def main(args):
-    regs = ["ElasticNet"]
-    encs = ["iCoVAE"]
-    seeds = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+    regs = ["ElasticNet", "SVR", "RandomForestRegressor"]
+    encs = ["iCoVAE", "VAE"]
+    seeds = [4563]
 
     for seed in seeds:
         for reg in regs:
             for enc in encs:
+                # Added  for new model version
                 job_path_root = f"{wd_path}/data/outputs/{args.dataset}/{args.target}/{args.experiment}/pico/{reg}_{enc.lower()}"
-                job_path = f"{job_path_root}/test_metrics_s{seed}.csv"
-                job_path_val = f"{job_path_root}/z_pred_val_0_best_s{seed}.csv"
+                job_path = f"{job_path_root}/test_metrics.csv"
+                # job_path_val = f"{job_path_root}/z_pred_val_0_best_s{seed}.csv"
 
                 if os.path.exists(job_path) and not args.newstudy:
                     print(f"Job previously completed: {job_path}")
-                elif not os.path.exists(job_path_val) or True:
+                else:
                     if args.dataset == "depmap_gdsc":
                         script = submission_pico_sk_gdsc(
                             dataset=args.dataset,
@@ -153,8 +154,6 @@ def main(args):
                     print("Running: sbatch " + script_name)
                     os.system("sbatch " + script_name)
                     time.sleep(0.1)
-                else:
-                    print(f"Job previously completed: {job_path}")
 
 
 # To cancel these jobs, run the below

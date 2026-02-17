@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import random
 
-from utils.data_utils import Manual, get_data_loaders, process_data
+from utils.data_utils import Manual, get_data_loaders, process_data, get_constraints
 from models.pico import BaselineNN
 
 import os
@@ -23,7 +23,7 @@ import optuna
 from optuna.trial import TrialState
 
 
-def main(trial, x, s, y, args, hopt=True):
+def main(trial, x, s, y, args, hopt=True, save_preds=False):
     """
     run inference for SS-VAE
     :param args: arguments for SS-VAE
@@ -45,23 +45,49 @@ def main(trial, x, s, y, args, hopt=True):
         val_split = 0.2
 
     # Change to grid search
-    args.batch_size = 2 ** (trial.suggest_int("batch_size", 3, 6, step=1))
-    args.learning_rate = 10 ** (trial.suggest_float("learning_rate", -4, -2, step=1))
-    args.weight_decay = 10 ** (trial.suggest_float("weight_decay", -4, -2, step=1))
-    args.dropout = trial.suggest_float("dropout", 0.0, 0.5, step=0.1)
-    args.model_size = trial.suggest_categorical("model_size", ["linear", "1", "2", "3"])
+    args.batch_size = 32
+    args.dropout = trial.suggest_categorical("dropout", [0.0, 0.2])
+    args.layer_width = trial.suggest_categorical("layer_width", [64, 128])
+    args.learning_rate = trial.suggest_categorical("learning_rate", [1e-4, 3e-4])
+    args.n_layers = trial.suggest_categorical("n_layers", [1, 2])
+    args.weight_decay = trial.suggest_categorical("weight_decay", [0.0, 1e-4])
 
     trial.set_user_attr("seed", args.seed)
 
     # Default filtering for variance above 1 in x
-    dataset_params = {"var_filt_x": 1, "var_filt_s": None}
+    dataset_params = {"var_filt_x": 1500, "var_filt_s": None}
+
+    # NEED TO PROPAGATE CONSTRAINTS TO GET SAME DATA LOADING AS ICOVAE
+    trial.set_user_attr("constraints", args.constraints)
+
+    # If z dim is not large enough for all constraints then fill half the latent space
+    if len(args.constraints) > 16:
+        # Take first 16 constraints only --- iCoVAE best params give 32 dim latent space so use this
+        args.curr_constraints = args.constraints[:16]
+    else:
+        args.curr_constraints = args.constraints
+
+    # Save constraints used for this trial
+    trial.set_user_attr("curr_constraints", args.curr_constraints)
+
+    # Use dummy constraints and target if not provided
+    # For clinical data studies, availability of y determines which samples are used in VAE training, so target should be supplied
+    # if args.confounders is None:
+    # If confounders is None assume not using c
+    # pass
+    if args.curr_constraints is None:
+        args.curr_constraints = s.columns.values.tolist()[:2]
+    if args.target is None:
+        # Takes first column in y as target
+        # This might put extra values in training set compared to iCoVAE
+        args.target = y.columns.values.tolist()[0]
 
     # MAKING DATASET
     dataset = Manual(
         x=x,
         s=s,
         y=y,
-        constraints=[s.dropna(axis=1).columns[0]],
+        constraints=args.curr_constraints,
         target=args.target,
         params=dataset_params,
         verbose=True,
@@ -84,7 +110,7 @@ def main(trial, x, s, y, args, hopt=True):
                 )
                 return previous_trial.value
 
-    fold_min_losses = []
+    fold_metrics = []
     fold_best_epochs = []
 
     for curr_fold in range(cv_num):
@@ -109,7 +135,8 @@ def main(trial, x, s, y, args, hopt=True):
         input_dim = x_0.shape[0]
 
         model = BaselineNN(
-            reg_model_size=args.model_size,
+            n_layers=args.n_layers,
+            layer_width=args.layer_width,
             input_dim=input_dim,
             output_dim=1,
             dropout=args.dropout,
@@ -134,7 +161,7 @@ def main(trial, x, s, y, args, hopt=True):
 
         best_score = np.Inf
         counter = 0
-        patience = 10
+        patience = 30
         for epoch in range(0, args.num_epochs):
             model.train()
             # compute number of batches for an epoch
@@ -283,39 +310,37 @@ def main(trial, x, s, y, args, hopt=True):
             best_epoch = losses_df["val_loss"].idxmin() + 1
 
             fold_best_epochs.append(best_epoch)
-            fold_min_losses.append(np.nanmin(losses_df["val_loss"].tolist()))
+            # Get metrics at best epoch
+            curr_fold_metrics = losses_df.iloc[best_epoch - 1]
+            curr_fold_metrics["fold"] = curr_fold
+            curr_fold_metrics["best_epoch"] = best_epoch
+            fold_metrics.append(curr_fold_metrics)
         else:
             # SAVE LOSSES FROM FOLD TO CSV
             losses_df = pd.DataFrame.from_dict(metric_dict_list)
             losses_df.to_csv(f"{save_folder}/losses_best_retrain.csv")
 
     if hopt:
+        fold_metrics = pd.concat(fold_metrics, axis=0)
         # SAVE TRIAL ARGS -- INCLUDING BEST VAL LOSS AND BEST EPOCH
-        args.val_loss = float(np.nanmean(fold_min_losses))
+        args.val_loss = float(np.nanmean(fold_metrics["val_loss"]))
         args.best_epoch = round(np.mean(fold_best_epochs))
         with open(f"{save_folder}/args_{trial.number}.txt", "w") as f:
             json.dump(args.__dict__, f, indent=2)
 
         # SAVE TRIAL RESULTS
-        folds_df = pd.DataFrame(
-            {
-                "fold": range(cv_num),
-                "val_rmse": fold_min_losses,
-                "best_epoch": fold_best_epochs,
-            }
-        )
-        folds_df.to_csv(f"{save_folder}/cv_results_{trial.number}.csv")
+        fold_metrics.to_csv(f"{save_folder}/cv_results_{trial.number}.csv")
 
         # SAVE MEAN OF TRIAL BEST EPOCHS FOR RETRAINING
         trial.set_user_attr("num_epochs", np.mean(fold_best_epochs))
 
         # PRINT TRIAL RESULTS
         print(
-            f"Trial {trial.number} val loss ({cv_num}-fold CV): {np.nanmean(fold_min_losses)} ({np.nanstd(fold_min_losses)})"
+            f"Trial {trial.number} val loss ({cv_num}-fold CV): {np.nanmean(fold_metrics['val_loss'])} ({np.nanstd(fold_metrics['val_loss'])})"
         )
 
         # RETURN MEAN LOSS ACROSS CVS FOR OPTUNA
-        return np.nanmean(fold_min_losses)
+        return np.nanmean(fold_metrics["val_loss"])
 
     else:
         # SAVE MODEL AFTER FINAL EPOCH
@@ -371,7 +396,7 @@ def parser_args(parser):
         help="use GPU(s) to speed up training",
     )
     parser.add_argument(
-        "-n", "--num-epochs", default=200, type=int, help="number of epochs to run"
+        "-n", "--num-epochs", default=300, type=int, help="number of epochs to run"
     )
     parser.add_argument(
         "-target",
@@ -413,6 +438,13 @@ def parser_args(parser):
         action="store_true",
         help="Whether to always start a new study in optuna",
     )
+    parser.add_argument(
+        "-constraints",
+        default=None,
+        type=str,
+        nargs="+",
+        help="If specified, uses these constraints rather than using defaults or selecting automatically",
+    )
 
     return parser
 
@@ -436,6 +468,25 @@ if __name__ == "__main__":
     )
     args.test_samples = test_samples
     # END OF TASK SPECIFIC SECTION
+    # SELECTING CONSTRAINTS
+    if args.constraints is None:
+        # Loading constraints for depmap_gdsc
+        args.constraints = get_constraints(
+            drug=args.target,
+            dataset_name=args.dataset,
+            zdim=512,
+            experiment=args.experiment,
+            col_thresh=0.9,
+            wd_path=wd_path,
+        )
+    else:
+        if args.constraints[0] == "breast_drivers":
+            args.constraints = np.loadtxt(
+                f"{wd_path}/data/processed/datasets/breast_cancer_drivers_filt.txt",
+                dtype="str",
+            ).tolist()
+        else:
+            pass
 
     # Set stage for data loaders
     args.stage = "p"
@@ -445,10 +496,10 @@ if __name__ == "__main__":
     if args.newstudy:
         try:
             optuna.delete_study(
-                storage=f"sqlite:////{wd_path}/data/outputs/{args.dataset}/icovae_optuna.db",
+                storage=f"sqlite:////{wd_path}/data/outputs/{args.dataset}/nn_optuna.db",
                 study_name="_".join(save_folder.split("/")[-3:]) + f"_s{args.seed}",
             )
-        except UserWarning("No study found to delete..."):
+        except:
             pass
 
     storage = optuna.storages.RDBStorage(
@@ -456,9 +507,7 @@ if __name__ == "__main__":
         engine_kwargs={"connect_args": {"timeout": 100}},
     )
     study = optuna.create_study(
-        sampler=optuna.samplers.TPESampler(
-            n_startup_trials=50, multivariate=True, seed=args.seed
-        ),
+        sampler=optuna.samplers.BruteForceSampler(),
         storage=storage,
         study_name="_".join(save_folder.split("/")[-3:]) + f"_s{args.seed}",
         load_if_exists=True,
@@ -466,16 +515,9 @@ if __name__ == "__main__":
 
     n_complete_trials = len(study.trials)
 
-    def func(trial):
-        """
-        Function to be optimized by optuna
-        :param trial: optuna trial object
-        :return: validation loss for the trial
-        """
-        # Call main function with trial and args and global variables
-        return main(trial, x=x, s=s, y=y, args=args, hopt=True)
+    func = lambda trial: main(trial, x=x, s=s, y=y, args=args, hopt=True)
 
-    study.optimize(func, n_trials=100 - n_complete_trials)
+    study.optimize(func, n_trials=150 - n_complete_trials)
 
     study_df = study.trials_dataframe(
         attrs=("number", "value", "params", "state")
