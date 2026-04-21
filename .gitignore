@@ -2,14 +2,29 @@
 __pycache__/
 .ruff_cache/
 .ipynb_checkpoints/
+.DS_Store
 
-# Local data + outputs
+# Claude Code working state (per-user; never committed)
+.claude/
+.claude.json
+CLAUDE.md
+**/.claude/
+**/CLAUDE.md
+
+# Local data + outputs (raw downloads, training outputs, generated figures)
 data/
 src/data/
 src/data/outputs/
 src/fonts/
+demo/outputs/
+demo/figures/
 
 # Model artifacts
 *.pt
 *.pth
 *.ckpt
+
+# …but the small preprocessed subset + pretrained encoders bundled for the
+# demo notebooks must stay tracked. Negate the above rules inside demo/assets/.
+!demo/assets/
+!demo/assets/**

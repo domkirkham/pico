@@ -1,26 +1,48 @@
-import sys
+"""Hyperparameter optimisation and refitting for the baseline MLP regressor.
 
-wd_path = "/home/dk538/rds/hpc-work/pico/src"
-sys.path.append(wd_path)
+This script runs an Optuna BruteForceSampler study over a simple fully
+connected neural network baseline (models.pico.BaselineNN) that predicts the
+target directly from the input expression matrix. Each trial trains the model
+with one configuration from the grid using 5-fold cross-validation and returns
+the mean validation loss. After the search completes, the best trial's mean
+best-epoch count is used to refit the model on the full training split once
+with the primary seed and again for ten additional random seeds
+(10, 20, ..., 100), collecting test-set RMSE / Pearson / Spearman metrics.
+
+Inputs are loaded via utils.data_utils.process_data and utils.data_utils.Manual,
+which return (x, s, c, y, test_samples) for the selected dataset and
+experiment. Outputs are written under
+data/outputs/<dataset>/<target>/<experiment>/nn/ and include per-trial loss
+CSVs, cross-validation summaries, args JSONs, the Optuna SQLite database
+(data/outputs/<dataset>/nn_optuna.db), study results, test predictions, and
+checkpoints best_model_<seed>.tar.
+
+Example:
+    python src/scripts/nn_hopt.py -target AFATINIB -dataset depmap_gdsc \\
+        --experiment h16 --cuda
+"""
 
 import argparse
-
-import torch
-import sys
-import numpy as np
-import pandas as pd
-import random
-
-from utils.data_utils import Manual, get_data_loaders, process_data, get_constraints
-from models.pico import BaselineNN
-
-import os
 import json
+import os
+import random
 import shutil
+import sys
 
-# hyperopt imports
+import numpy as np
 import optuna
 from optuna.trial import TrialState
+import pandas as pd
+import torch
+
+wd_path = os.environ.get(
+    "PICO_SRC",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+sys.path.append(wd_path)
+
+from models.pico import BaselineNN
+from utils.data_utils import Manual, get_constraints, get_data_loaders, process_data
 
 
 def main(trial, x, s, y, args, hopt=True, save_preds=False):
@@ -72,9 +94,6 @@ def main(trial, x, s, y, args, hopt=True, save_preds=False):
 
     # Use dummy constraints and target if not provided
     # For clinical data studies, availability of y determines which samples are used in VAE training, so target should be supplied
-    # if args.confounders is None:
-    # If confounders is None assume not using c
-    # pass
     if args.curr_constraints is None:
         args.curr_constraints = s.columns.values.tolist()[:2]
     if args.target is None:
@@ -273,8 +292,6 @@ def main(trial, x, s, y, args, hopt=True, save_preds=False):
                         {"state_dict": model.state_dict()},
                         f"{save_folder}/best_model_{curr_fold}_{trial.number}.tar",
                     )
-                    # torch.save(model, f"{save_folder}/best_model_{curr_fold}_{trial.number}.pt")
-                    # model.save_models(save_folder, fold=trial.number)
                     counter = 0
                 else:
                     # val_loss does not improve, we increase the counter
@@ -393,26 +410,44 @@ def parser_args(parser):
         "--cuda",
         default=False,
         action="store_true",
-        help="use GPU(s) to speed up training",
+        help="Use GPU(s) for training; requires a CUDA-enabled PyTorch install.",
     )
     parser.add_argument(
-        "-n", "--num-epochs", default=300, type=int, help="number of epochs to run"
+        "-n",
+        "--num-epochs",
+        default=300,
+        type=int,
+        help="Maximum number of training epochs per fold (--num-epochs / -n). Early stopping may terminate sooner.",
     )
     parser.add_argument(
         "-target",
         type=str,
         default="ABCD",
         metavar="T",
-        help="Target column from y",
+        help=(
+            "Target column in y (e.g. 'AFATINIB' for depmap_gdsc, 'RCB.score' for "
+            "TransNEO treatment response)."
+        ),
     )
     parser.add_argument(
         "-dataset",
         type=str,
         default="depmap_gdsc",
         metavar="S",
-        help="Dataset name (e.g. depmap_gdsc)",
+        help=(
+            "Dataset name; see src/utils/data_utils.py:process_data for registered "
+            "options (e.g. 'depmap_gdsc', 'depmap_gdsc_transneo')."
+        ),
     )
-    parser.add_argument("-seed", default=4563, type=int, help="Random seed")
+    parser.add_argument(
+        "-seed",
+        default=4563,
+        type=int,
+        help=(
+            "Random seed. Used both for the Optuna sampler and for Python/NumPy/PyTorch "
+            "random number generation inside the model."
+        ),
+    )
     parser.add_argument("--data-dir", type=str, default="./data", help="Data path")
     parser.add_argument(
         "--norm",
@@ -430,26 +465,36 @@ def parser_args(parser):
         "--experiment",
         default=None,
         type=str,
-        help="Experiment to run (user defined in data loading class)",
+        help=(
+            "User-defined experiment tag propagated into output paths "
+            "(e.g. 'h16' for 16 held-out cancer types, 'artemis_pbcp' for TransNEO external validation)."
+        ),
     )
     parser.add_argument(
         "--newstudy",
         default=False,
         action="store_true",
-        help="Whether to always start a new study in optuna",
+        help=(
+            "Delete the existing Optuna SQLite study at the target save folder before "
+            "creating a fresh one. Use this when you've changed the hyperparameter search space."
+        ),
     )
     parser.add_argument(
         "-constraints",
         default=None,
         type=str,
         nargs="+",
-        help="If specified, uses these constraints rather than using defaults or selecting automatically",
+        help=(
+            "If specified, uses these constraints rather than using defaults or "
+            "selecting automatically."
+        ),
     )
 
     return parser
 
 
 if __name__ == "__main__":
+    # 1. Parse args and build save folder
     parser = argparse.ArgumentParser()
     parser = parser_args(parser)
     args = parser.parse_args()
@@ -458,10 +503,10 @@ if __name__ == "__main__":
     save_folder = (
         f"{wd_path}/data/outputs/{args.dataset}/{args.target}/{args.experiment}/nn"
     )
-    # save_folder = f"./data/outputs/{timestr}"
     if not os.path.exists(save_folder):
         os.makedirs(save_folder, exist_ok=True)
 
+    # 2. Load data and select constraints
     # TASK SPECIFIC SECTION
     x, s, c, y, test_samples = process_data(
         dataset=args.dataset, wd_path=wd_path, experiment=args.experiment
@@ -491,6 +536,8 @@ if __name__ == "__main__":
     # Set stage for data loaders
     args.stage = "p"
     args.save_folder = save_folder
+
+    # 3. Build Optuna study
     # CREATE OPTUNA STUDY
     # If specified to start new study and the study already exists, delete the study
     if args.newstudy:
@@ -515,6 +562,7 @@ if __name__ == "__main__":
 
     n_complete_trials = len(study.trials)
 
+    # 4. Run hopt
     func = lambda trial: main(trial, x=x, s=s, y=y, args=args, hopt=True)
 
     study.optimize(func, n_trials=150 - n_complete_trials)
@@ -524,10 +572,10 @@ if __name__ == "__main__":
     ).sort_values(by="value")
     study_df.to_csv(f"{save_folder}/opt_study_results_s{args.seed}.csv")
 
+    # 5. Refit best trial for 10 seeds
     # REFIT MODEL USING BEST TRIAL
     args.num_epochs = int(np.round(study.best_trial.user_attrs["num_epochs"]))
     metrics = main(study.best_trial, x=x, s=s, y=y, args=args, hopt=False)
-    # metrics = {key: [val] for key, val in metrics.items()}
 
     # REFIT FOR 10 RANDOM SEEDS
     metrics = {"test_rmse": [], "test_pearson": [], "test_spearman": []}

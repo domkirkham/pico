@@ -1,29 +1,49 @@
-import sys
+"""Hyperparameter optimisation and refitting for the no-encoder scikit-learn baseline.
 
-wd_path = "/home/dk538/rds/hpc-work/pico/src"
-sys.path.append(wd_path)
+This script runs an Optuna BruteForceSampler study over a scikit-learn style
+prediction head (models.pico.BaselineSK) fit directly on the input expression
+matrix (optionally after PCA), with no learned encoder. It exists as the
+"no-representation" baseline against which encoder-based PiCoSK heads are
+compared. Each trial fits the regressor with one configuration from the grid
+using 5-fold cross-validation. After the search completes, the best trial is
+refit once with the primary seed and again for ten additional random seeds
+(10, 20, ..., 100) to collect test metrics.
+
+Inputs are loaded via utils.data_utils.process_data and
+utils.data_utils.Manual. Constraints and test-sample lists are pinned via the
+matching iCoVAE encoder args at
+data/outputs/<dataset>/<target>/<experiment>/icovae/args_best.txt to keep the
+data split identical to the encoder runs. Outputs are written under
+data/outputs/<dataset>/<target>/<experiment>/<reg>[_pca]/ and include
+per-trial predictions, args JSONs, test metrics CSV, the Optuna SQLite database
+(sk_optuna.db), and the study results CSV.
+
+Example:
+    python src/scripts/sk_hopt.py -reg ElasticNet -target AFATINIB \\
+        -dataset depmap_gdsc --experiment h16 --pca
+"""
 
 import argparse
-import torch
-
-import numpy as np
-import pandas as pd
-
-from utils.data_utils import Manual, get_data_loaders, process_data
-from models.pico import BaselineSK, get_search_spaces
-
-import os
 import json
+import os
 import random
 import shutil
+import sys
 
-
-# hyperopt imports
+import numpy as np
 import optuna
 from optuna.trial import TrialState
+import pandas as pd
+import torch
 
-# import wandb
-# from wandb_osh.hooks import TriggerWandbSyncHook
+wd_path = os.environ.get(
+    "PICO_SRC",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+sys.path.append(wd_path)
+
+from models.pico import BaselineSK, get_search_spaces
+from utils.data_utils import Manual, get_data_loaders, process_data
 
 
 def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
@@ -39,9 +59,6 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
     torch.manual_seed(args.seed)
 
     args.batch_size = 32
-
-    # SET UP WANDB
-    # trigger_sync = TriggerWandbSyncHook()
 
     if hopt:
         cv_num = 5
@@ -96,18 +113,6 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
                 )
                 return previous_trial.value
 
-    # Start a new wandb run to track this script.
-    # run = wandb.init(name=f"{'_'.join(args.save_folder.split('/')[-5:])}_{'train' if hopt else 'test'}",
-    #         # Set the wandb entity where your project will be logged (generally your team name).
-    #         entity="nifnet",
-    #         # Set the wandb project where this run will be logged.
-    #         project="pico",
-    #         # Track hyperparameters and run metadata.
-    #         config=args,
-    #         mode="offline",
-    #         dir=f"{wd_path}/data/wandb",
-    #     )
-
     for curr_fold in range(cv_num):
         if not hopt:
             print(f"\n[Seed {args.seed}] Retraining best model...")
@@ -126,8 +131,6 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
         )
 
         x, _, _, _, _, _ = dataset[0]
-        # input_dim = x.shape[0]
-        # print(f"Input dim: {input_dim}")
 
         # CREATE PICO MODEL
         model = BaselineSK(
@@ -203,9 +206,6 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
         for key, val in fold_metrics.items():
             folds_df_dict[f"val_{key}"] = val
 
-            # Run summary with mean over folds
-            # run.summary[f"val_{key}"] = float(np.nanmean(val))
-
         if save_preds:
             folds_df = pd.DataFrame.from_dict(folds_df_dict)
 
@@ -217,11 +217,6 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
         args.val_loss = float(
             np.nanmean(folds_df_dict[f"val_{metric_names[model.metric_type][0]}"])
         )
-        # with open(f"{args.save_folder}/args_{trial.number}_s{args.seed}.txt", "w") as f:
-        #     json.dump(args.__dict__, f, indent=2)
-
-        # trigger_sync()
-        # run.finish()
 
         # RETURN FOR OPTUNA
         return args.val_loss
@@ -248,41 +243,51 @@ def parser_args(parser):
         type=str,
         default="ABCD",
         metavar="D",
-        help="Target column from y",
+        help=(
+            "Target column in y (e.g. 'AFATINIB' for depmap_gdsc, 'RCB.score' for "
+            "TransNEO treatment response)."
+        ),
     )
     parser.add_argument(
         "-dataset",
         type=str,
         default="depmap_gdsc",
         metavar="S",
-        help="Dataset name (e.g. depmap_gdsc)",
+        help=(
+            "Dataset name; see src/utils/data_utils.py:process_data for registered "
+            "options (e.g. 'depmap_gdsc', 'depmap_gdsc_transneo')."
+        ),
     )
     parser.add_argument(
         "-reg",
         type=str,
         default="ElasticNet",
         metavar="M",
-        help="Regressor type",
+        help=(
+            "Regressor type for the prediction head. Valid options come from "
+            "models.pico.get_search_spaces (e.g. 'ElasticNet', 'SVR', "
+            "'RandomForestRegressor', 'LogisticRegression', 'CoxPH')."
+        ),
     )
     parser.add_argument(
         "--confounders",
         default=None,
         type=str,
         nargs="+",
-        help="Confounders for prediction model",
+        help="Confounders for prediction model.",
     )
     parser.add_argument(
         "--pca",
         default=False,
         action="store_true",
-        help="Whether to fit a PCA on the input data before fitting the regression model",
+        help="Whether to fit a PCA on the input data before fitting the regression model.",
     )
     parser.add_argument(
         "--duration-event",
         default=None,
         type=str,
         nargs=2,
-        help="Duration and event column suffix i.e. target_duration and target_event",
+        help="Duration and event column suffix i.e. target_duration and target_event.",
     )
     parser.add_argument(
         "--strata",
@@ -291,7 +296,15 @@ def parser_args(parser):
         nargs="+",
         help="Strata if using CoxPH. Should also be a confounder.",
     )
-    parser.add_argument("-seed", default=4563, type=int, help="Random seed")
+    parser.add_argument(
+        "-seed",
+        default=4563,
+        type=int,
+        help=(
+            "Random seed. Used both for the Optuna sampler and for Python/NumPy/PyTorch "
+            "random number generation inside the regressor."
+        ),
+    )
     parser.add_argument("--data-dir", type=str, default="./data", help="Data path")
     parser.add_argument(
         "--norm",
@@ -309,19 +322,26 @@ def parser_args(parser):
         "--experiment",
         default=None,
         type=str,
-        help="Experiment to run (user defined in data loading class)",
+        help=(
+            "User-defined experiment tag propagated into output paths "
+            "(e.g. 'h16' for 16 held-out cancer types, 'artemis_pbcp' for TransNEO external validation)."
+        ),
     )
     parser.add_argument(
         "--newstudy",
         default=False,
         action="store_true",
-        help="Whether to always start a new study in optuna",
+        help=(
+            "Delete the existing Optuna SQLite study at the target save folder before "
+            "creating a fresh one. Use this when you've changed the hyperparameter search space."
+        ),
     )
 
     return parser
 
 
 if __name__ == "__main__":
+    # 1. Parse args and resolve encoder/save paths
     parser = argparse.ArgumentParser()
     parser = parser_args(parser)
     args = parser.parse_args()
@@ -347,6 +367,7 @@ if __name__ == "__main__":
     else:
         args.enc_path = f"{args.enc_path}/default/icovae"
 
+    # 2. Load encoder args (pins constraints / test samples / pca_dim to the encoder step)
     # LOAD ARGUMENTS FOR ENCODER -- REQUIRED TO USE THE SAME CONSTRAINTS IN DATA LOADING and keep same data points
     with open(f"{args.enc_path}/args_best.txt", "r") as f:
         enc_args = json.load(f)
@@ -358,9 +379,6 @@ if __name__ == "__main__":
     # If using PCA, use the same dimensionality as the encoder
     args.pca_dim = enc_args["z_dim"]
 
-    # enc_args = pd.Series(enc_args).to_frame().T
-    # Get constraints from enc args
-
     # LOAD BEST TRIAL FROM OPTUNA DB
     # We don't need to know anything about the encoder arguments in this case
 
@@ -371,21 +389,17 @@ if __name__ == "__main__":
         n_trials *= len(val)
     print(f"Number of trials to run for {args.reg}: {n_trials}")
 
-    # timestr = time.strftime("%Y%m%d_%H%M%S")
     save_folder = f"{wd_path}/data/outputs/{args.dataset}/{args.target}/{args.experiment}/{args.reg}"
     if args.pca:
         save_folder = f"{save_folder}_pca"
-    # save_folder = f"./data/outputs/{timestr}"
     if not os.path.exists(save_folder):
         os.makedirs(save_folder, exist_ok=True)
 
+    # 3. Load data
     # TASK SPECIFIC SECTION
     x, s, c, y, test_samples = process_data(
         dataset=args.dataset, wd_path=wd_path, experiment=args.experiment
     )
-    # Check dataset is being processed in the same way as in iCoVAE step
-    # assert sorted(test_samples) == sorted(args.test_samples)
-    # Fix this
     args.test_samples = test_samples
     # END OF TASK SPECIFIC SECTION
 
@@ -394,6 +408,7 @@ if __name__ == "__main__":
     args.stage = "p"
     args.save_folder = save_folder
 
+    # 4. Build Optuna study
     # If specified to start new study and the study already exists, delete the study
     if args.newstudy:
         try:
@@ -416,6 +431,7 @@ if __name__ == "__main__":
         load_if_exists=True,
     )
 
+    # 5. Run hopt
     func = lambda trial: main(trial, x=x, s=s, c=c, y=y, args=args)
 
     n_complete_trials = len(study.trials)
@@ -427,6 +443,7 @@ if __name__ == "__main__":
     ).sort_values(by="value")
     study_df.to_csv(f"{args.save_folder}/opt_study_results_s{args.seed}.csv")
 
+    # 6. Refit best trial for 10 seeds
     # REFIT MODEL USING BEST TRIAL
     # RUN HOPT AGAIN BUT SAVE PREDICTIONS
     main(study.best_trial, x=x, s=s, c=c, y=y, args=args, hopt=True, save_preds=True)

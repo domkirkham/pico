@@ -34,7 +34,6 @@ from typing import Any, List
 import matplotlib.font_manager as fm
 
 # Download the font
-# wd_path = "/home/dk538/rds/hpc-work/graphdep"
 # font_url = "https://github.com/adobe-fonts/source-sans/blob/release/TTF/SourceSans3-Regular.ttf?raw=True"
 # font_path = f"{wd_path}/results_analysis/figures/SourceSans3-Regular.ttf"  # Specify where to save the font
 # font_bold_url = "https://github.com/adobe-fonts/source-sans/blob/release/TTF/SourceSans3-Bold.ttf?raw=True"
@@ -46,7 +45,6 @@ import matplotlib.font_manager as fm
 # urllib.request.urlretrieve(font_it_url, font_it_path)
 
 # in a terminal, run
-# cp ~/rds/hpc-work/graphdep/results_analysis/figures/*ttf ~/.local/share/fonts
 # fc-cache -f -v
 # rm -fr ~/.cache/matplotlib
 

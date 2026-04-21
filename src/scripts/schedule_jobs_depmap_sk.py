@@ -1,12 +1,33 @@
-import sys
+"""Generate and submit SLURM jobs for the no-encoder scikit-learn baseline on DepMap drugs.
 
-wd_path = "/home/dk538/rds/hpc-work/pico/src"
-sys.path.append(wd_path)
+This script writes a SLURM submission script for each combination of regressor
+('ElasticNet', 'RandomForestRegressor', 'SVR'), PCA on/off, drug target (sweeps
+the full hard-coded `target_dict` of GDSC drugs and their target classes used
+in the H16 holdout experiments) and seed (4563), then submits each job via
+`sbatch`. Submitted jobs invoke src/scripts/sk_hopt.py with the matching
+command-line arguments.
 
-import os
-import time
+Inputs are command-line arguments listing the dataset, optional experiment tag,
+walltime and a --newstudy resubmission flag. Outputs are SLURM scripts written
+to <wd_path>/submissions/ and the queued jobs themselves; the existing
+test_metrics.csv check is currently disabled (the `and False` guard) so all
+combinations are always submitted.
+
+Example:
+    python src/scripts/schedule_jobs_depmap_sk.py -dataset depmap_gdsc \\
+        --experiment h16 -walltime 24:00:00
+"""
 
 import argparse
+import os
+import sys
+import time
+
+wd_path = os.environ.get(
+    "PICO_SRC",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+sys.path.append(wd_path)
 
 feat_sets_dict_transneo = {
     "Rep": "",
@@ -47,9 +68,9 @@ module purge                               # Removes all modules still loaded
 module load rhel8/default-icl              # REQUIRED - loads the basic environment
 
 #! Insert additional module load commands after this line if needed:
-source /home/dk538/.bashrc
+source ~/.bashrc
 module load hdf5/1.8.2
-conda activate slurm-torch-2
+conda activate pico                 # EDIT: name of the conda env where pico is installed
 
 application="python -u ./scripts/sk_hopt.py"
 
@@ -83,9 +104,6 @@ eval $CMD"""
         script_args = rf"""{script_args} --experiment {experiment}"""
     if pca:
         script_args = rf"""{script_args} --pca"""
-    # Don't run on GPU
-    # else:
-    # script_args = fr'''{script_args} --cuda'''
     script_args = rf'''{script_args}"'''
 
     submission = rf"""{submission_preamble}
@@ -186,7 +204,6 @@ def main(args):
                         job_path_root = f"{job_path_root}_pca"
 
                     job_path = f"{job_path_root}/test_metrics.csv"
-                    # job_path_val = f"{job_path_root}/z_pred_val_0_best_s{seed}.csv"
 
                     if os.path.exists(job_path) and not args.newstudy and False:
                         print(f"Job previously completed: {job_path}")
@@ -222,13 +239,11 @@ def main(args):
                         print("Running: sbatch " + script_name)
                         os.system("sbatch " + script_name)
                         time.sleep(0.1)
-                    # else:
-                    # print(f"Job previously completed: {job_path}")
 
 
 # To cancel these jobs, run the below
 # squeue --me --states=ALL --Format=jobid,name --noheader |
-#   grep dk538-ssvae |
+#   grep <your-job-name> |
 #   awk '{print $1}' |
 #   xargs scancel
 
@@ -239,33 +254,40 @@ def parser_args(parser):
         type=str,
         default="depmap_gdsc",
         metavar="S",
-        help="Dataset name (e.g. depmap_gdsc)",
+        help=(
+            "Dataset name; supported by this script: 'depmap_gdsc', 'depmap_ctrp'."
+        ),
     )
     parser.add_argument(
         "--experiment",
         default=None,
         type=str,
-        help="Experiment to run (user defined in data loading class)",
+        help=(
+            "User-defined experiment tag propagated into output paths "
+            "(e.g. 'h16' for 16 held-out cancer types, 'artemis_pbcp' for TransNEO external validation)."
+        ),
     )
     parser.add_argument(
         "-walltime",
         default="24:00:00",
         type=str,
-        help="Walltime per job",
+        help="Walltime per job in HH:MM:SS format.",
     )
     parser.add_argument(
         "--newstudy",
         default=False,
         action="store_true",
-        help="If specified, resubmits all jobs regardless of previous completion",
+        help="If specified, resubmits all jobs regardless of previous completion.",
     )
 
     return parser
 
 
 if __name__ == "__main__":
+    # 1. Parse args
     parser = argparse.ArgumentParser()
     parser = parser_args(parser)
     args = parser.parse_args()
 
+    # 2. Submit jobs
     main(args)

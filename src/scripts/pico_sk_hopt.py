@@ -1,29 +1,49 @@
-import sys
+"""Hyperparameter optimisation and refitting for PiCo prediction heads on a frozen encoder.
 
-wd_path = "/home/dk538/rds/hpc-work/pico/src"
-sys.path.append(wd_path)
+This script runs an Optuna BruteForceSampler study over the scikit-learn style
+PiCoSK prediction head stacked on top of a pretrained iCoVAE or vanilla VAE
+encoder. For each trial the encoder checkpoint is loaded, frozen, and used to
+produce a representation for the target samples. A regressor is then fit on
+this representation (combined optionally with clinical confounders), and
+5-fold CV validation metrics are returned to Optuna. After the search
+completes, the best trial is refit once with the primary seed and again for
+ten additional random seeds (10, 20, ..., 100) to collect test metrics.
+
+Inputs are loaded via utils.data_utils.process_data and
+utils.data_utils.Manual. The encoder args JSON at
+data/outputs/<dataset>/<target>/<experiment>/{icovae,vae}/args_best.txt is
+used to pin the constraint and test-sample lists identical to the encoder
+training step. Outputs are written under
+data/outputs/<dataset>/<target>/<experiment>/pico/<reg>_<enc_tag>/ and include
+per-trial predictions, args JSONs, test metrics CSV, the Optuna SQLite
+database (pico_optuna.db), and the study results CSV.
+
+Example:
+    python src/scripts/pico_sk_hopt.py -reg ElasticNet -enc iCoVAE \\
+        -target AFATINIB -dataset depmap_gdsc --experiment h16
+"""
 
 import argparse
-import torch
-
-import numpy as np
-import pandas as pd
-
-from utils.data_utils import Manual, get_data_loaders, process_data
-from models.pico import PiCoSK, PiCoCox, get_search_spaces
-
-import os
 import json
+import os
 import random
 import shutil
+import sys
 
-
-# hyperopt imports
+import numpy as np
 import optuna
 from optuna.trial import TrialState
+import pandas as pd
+import torch
 
-# import wandb
-# from wandb_osh.hooks import TriggerWandbSyncHook
+wd_path = os.environ.get(
+    "PICO_SRC",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+sys.path.append(wd_path)
+
+from models.pico import PiCoSK, get_search_spaces
+from utils.data_utils import Manual, get_data_loaders, process_data
 
 
 def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
@@ -39,9 +59,6 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
     torch.manual_seed(args.seed)
 
     args.batch_size = 32
-
-    # SET UP WANDB
-    # trigger_sync = TriggerWandbSyncHook()
 
     if hopt:
         cv_num = 5
@@ -107,18 +124,6 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
         f"{args.enc_path}/encoder_{args.seed}.pt", map_location=map_loc
     )
 
-    # Start a new wandb run to track this script.
-    # run = wandb.init(name=f"{'_'.join(args.save_folder.split('/')[-5:])}_{'train' if hopt else 'test'}",
-    # Set the wandb entity where your project will be logged (generally your team name).
-    #     entity="nifnet",
-    # Set the wandb project where this run will be logged.
-    #    project="pico",
-    # Track hyperparameters and run metadata.
-    #    config=args,
-    #    mode="offline",
-    #    dir=f"{wd_path}/data/wandb",
-    # )
-
     for curr_fold in range(cv_num):
         if not hopt:
             print(f"\n[Seed {args.seed}] Retraining best model...")
@@ -137,26 +142,17 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
         )
 
         x, _, _, _, _, _ = dataset[0]
-        # input_dim = x.shape[0]
-        # print(f"Input dim: {input_dim}")
 
         # CREATE PICO MODEL
         if args.reg == "CoxPH":
-            if args.strata is not None:
-                strata = [f"c_{args.confounders.index(st)}" for st in args.strata]
-            else:
-                strata = None
-            model = PiCoCox(
-                encoder=encoder,
-                model=args.reg,
-                use_cuda=args.cuda,
-                alpha=args.alpha,
-                l1_ratio=args.l1_ratio,
-                norep=args.norep,
-                duration_col=args.duration_event[0],
-                event_col=args.duration_event[1],
-                strata=strata,
-                random_state=args.seed,
+            # Cox-regression (time-to-event) head is scaffolding code not used
+            # in any paper figure. Port `PiCoCox` from graphdep/models/pico.py
+            # if you need survival analysis on top of an iCoVAE/VAE encoder.
+            raise NotImplementedError(
+                "The CoxPH / survival-analysis head (PiCoCox) is not shipped "
+                "in the public repo — it was never run for the paper. See "
+                "graphdep/models/pico.py:3457 for the implementation if you "
+                "need it."
             )
         else:
             model = PiCoSK(
@@ -244,8 +240,6 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
         folds_df_dict = {"fold": range(cv_num)}
         for key, val in fold_metrics.items():
             folds_df_dict[f"val_{key}"] = val
-            # Run summary with mean over folds
-            # run.summary[f"val_{key}"] = float(np.nanmean(val))
 
         if save_preds:
             # Only triggered when refitting the best trial
@@ -258,15 +252,6 @@ def main(trial, x, s, c, y, args, hopt=True, save_preds=False):
         args.val_loss = float(
             np.nanmean(folds_df_dict[f"val_{metric_names[model.metric_type][0]}"])
         )
-        # with open(f"{args.save_folder}/args_{trial.number}_s{args.seed}.txt", "w") as f:
-        #     json.dump(args.__dict__, f, indent=2)
-
-        # wandb_fold_metrics = {metric_name: metrics[i][0] for i, metric_name in enumerate(metric_names[model.metric_type])}
-
-        # Wandb logging
-        # run.summary(wandb_fold_metrics)
-        # trigger_sync()
-        # run.finish()
 
         # RETURN FOR OPTUNA
         return args.val_loss
@@ -293,49 +278,62 @@ def parser_args(parser):
         type=str,
         default="ABCD",
         metavar="D",
-        help="Target column from y",
+        help=(
+            "Target column in y (e.g. 'AFATINIB' for depmap_gdsc, 'RCB.score' for "
+            "TransNEO treatment response)."
+        ),
     )
     parser.add_argument(
         "-dataset",
         type=str,
         default="depmap_gdsc",
         metavar="S",
-        help="Dataset name (e.g. depmap_gdsc)",
+        help=(
+            "Dataset name; see src/utils/data_utils.py:process_data for registered "
+            "options (e.g. 'depmap_gdsc', 'depmap_gdsc_transneo')."
+        ),
     )
     parser.add_argument(
         "-enc",
         type=str,
         default="iCoVAE",
         metavar="M",
-        help="Encoder type",
+        help="Encoder type to load. Supported values: 'iCoVAE', 'VAE'.",
     )
     parser.add_argument(
         "-reg",
         type=str,
         default="ElasticNet",
         metavar="M",
-        help="Regressor type",
+        help=(
+            "Regressor type for the prediction head. Valid options come from "
+            "models.pico.get_search_spaces (e.g. 'ElasticNet', 'SVR', "
+            "'RandomForestRegressor', 'LogisticRegression', 'CoxPH')."
+        ),
     )
     parser.add_argument(
         "-constraints",
         default=None,
         type=str,
         nargs="+",
-        help="If specified, uses encoder with these constraints rather than using defaults/selecting automatically",
+        help=(
+            "If specified, uses encoder with these constraints rather than using "
+            "defaults/selecting automatically."
+        ),
     )
     parser.add_argument(
         "--confounders",
         default=None,
         type=str,
         nargs="+",
-        help="Confounders for prediction model",
+        help="Confounders for prediction model.",
     )
     parser.add_argument(
         "--duration-event",
         default=None,
         type=str,
         nargs=2,
-        help="Duration and event column suffix i.e. target_duration and target_event",
+        help="Duration and event column suffix i.e. target_duration and target_event.",
     )
     parser.add_argument(
         "--strata",
@@ -344,7 +342,15 @@ def parser_args(parser):
         nargs="+",
         help="Strata if using CoxPH. Should also be a confounder.",
     )
-    parser.add_argument("-seed", default=4563, type=int, help="Random seed")
+    parser.add_argument(
+        "-seed",
+        default=4563,
+        type=int,
+        help=(
+            "Random seed. Used both for the Optuna sampler and for Python/NumPy/PyTorch "
+            "random number generation inside the encoder and regressor."
+        ),
+    )
     parser.add_argument("--data-dir", type=str, default="./data", help="Data path")
     parser.add_argument(
         "--norm",
@@ -357,7 +363,10 @@ def parser_args(parser):
         "--lindec",
         default=False,
         action="store_true",
-        help="Use a linear decoder?",
+        help=(
+            "Use a linear decoder (--lindec / -ld). When set, selects the encoder "
+            "variant that was trained with a single linear decoder rather than an MLP."
+        ),
     )
     parser.add_argument(
         "--filt",
@@ -369,38 +378,47 @@ def parser_args(parser):
         "--experiment",
         default=None,
         type=str,
-        help="Experiment to run (user defined in data loading class)",
+        help=(
+            "User-defined experiment tag propagated into output paths "
+            "(e.g. 'h16' for 16 held-out cancer types, 'artemis_pbcp' for TransNEO external validation)."
+        ),
     )
     parser.add_argument(
         "--cuda",
         default=False,
         action="store_true",
-        help="use GPU(s) for encoder inference (not suggested)",
+        help=(
+            "Use GPU(s) for encoder inference; requires a CUDA-enabled PyTorch "
+            "install. Not suggested as the bottleneck is the scikit-learn fit."
+        ),
     )
     parser.add_argument(
         "--norep",
         default=False,
         action="store_true",
-        help="Whether to make a prediction model without using a representation",
+        help="Whether to make a prediction model without using a representation.",
     )
     parser.add_argument(
         "--newstudy",
         default=False,
         action="store_true",
-        help="Whether to always start a new study in optuna",
+        help=(
+            "Delete the existing Optuna SQLite study at the target save folder before "
+            "creating a fresh one. Use this when you've changed the hyperparameter search space."
+        ),
     )
 
     return parser
 
 
 if __name__ == "__main__":
+    # 1. Parse args and resolve encoder/save paths
     parser = argparse.ArgumentParser()
     parser = parser_args(parser)
     args = parser.parse_args()
 
     # Unless specified, assume model type is same drug with same seed
     # Otherwise leave as is
-    # TODO: added  for different model version
     if args.enc == "VAE":
         args.enc_path = f"{wd_path}/data/outputs/{args.dataset}/{args.target}"
         if args.experiment is not None:
@@ -430,6 +448,7 @@ if __name__ == "__main__":
     if args.norep:
         save_ext = f"{save_ext}_norep"
 
+    # 2. Load encoder args (pins constraints & test samples to the encoder step)
     # LOAD ARGUMENTS FOR ENCODER
     with open(f"{args.enc_path}/args_best.txt", "r") as f:
         enc_args = json.load(f)
@@ -441,9 +460,6 @@ if __name__ == "__main__":
         args.constraints = enc_args["curr_constraints"]
     args.test_samples = enc_args["test_samples"]
 
-    # enc_args = pd.Series(enc_args).to_frame().T
-    # Get constraints from enc args
-
     # LOAD BEST TRIAL FROM OPTUNA DB
     # We don't need to know anything about the encoder arguments in this case
 
@@ -454,19 +470,15 @@ if __name__ == "__main__":
         n_trials *= len(val)
     print(f"Number of trials to run for {args.reg}: {n_trials}")
 
-    # timestr = time.strftime("%Y%m%d_%H%M%S")
     save_folder = f"{wd_path}/data/outputs/{args.dataset}/{args.target}/{args.experiment}/pico/{args.reg}_{save_ext}"
-    # save_folder = f"./data/outputs/{timestr}"
     if not os.path.exists(save_folder):
         os.makedirs(save_folder, exist_ok=True)
 
+    # 3. Load data
     # TASK SPECIFIC SECTION
     x, s, c, y, test_samples = process_data(
         dataset=args.dataset, wd_path=wd_path, experiment=args.experiment
     )
-    # Check dataset is being processed in the same way as in iCoVAE step
-    # assert sorted(test_samples) == sorted(args.test_samples)
-    # Fix this
     args.test_samples = test_samples
     # END OF TASK SPECIFIC SECTION
 
@@ -475,6 +487,7 @@ if __name__ == "__main__":
     args.stage = "p"
     args.save_folder = save_folder
 
+    # 4. Build Optuna study
     # If specified to start new study and the study already exists, delete the study
     if args.newstudy:
         try:
@@ -497,6 +510,7 @@ if __name__ == "__main__":
         load_if_exists=True,
     )
 
+    # 5. Run hopt
     func = lambda trial: main(trial, x=x, s=s, c=c, y=y, args=args)
 
     n_complete_trials = len(study.trials)
@@ -508,6 +522,7 @@ if __name__ == "__main__":
     ).sort_values(by="value")
     study_df.to_csv(f"{args.save_folder}/opt_study_results_s{args.seed}.csv")
 
+    # 6. Refit best trial for 10 seeds
     # REFIT MODEL USING BEST TRIAL
     # RUN HOPT AGAIN BUT SAVE PREDICTIONS!
     main(study.best_trial, x=x, s=s, c=c, y=y, args=args, hopt=True, save_preds=True)

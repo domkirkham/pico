@@ -1,28 +1,48 @@
+"""Hyperparameter optimisation and refitting for the iCoVAE encoder.
+
+This script runs a TPE-sampled Optuna study over the iCoVAE
+(interpretable/constrained VAE) architecture. Each trial trains the model with
+a sampled configuration using 5-fold cross-validation and returns the mean
+validation loss. After the search completes, the best trial's mean best-epoch
+count is used to refit the model on the full training split once with the
+primary seed and again for ten additional random seeds (10, 20, ..., 100).
+
+Inputs are loaded via utils.data_utils.process_data and utils.data_utils.Manual,
+which return (x, s, c, y, test_samples) for the selected dataset and
+experiment. Constraints are drawn from get_constraints unless overridden on the
+command line. Outputs are written under
+data/outputs/<dataset>/<target>/<experiment>/icovae/ and include per-trial
+loss CSVs, cross-validation summaries, args JSONs, the Optuna SQLite database
+(icovae_optuna.db), the study results CSV, and checkpoints best_model_<seed>.tar
+for each refit seed.
+
+Example:
+    python src/scripts/icovae_hopt.py -target AFATINIB -dataset depmap_gdsc \\
+        --experiment h16 --cuda
+"""
+
+import argparse
+import json
+import os
+import random
+import shutil
 import sys
 
-wd_path = "/home/dk538/rds/hpc-work/pico/src"
-sys.path.append(wd_path)
-
-import random
-import argparse
-
+import numpy as np
+import optuna
+from optuna.trial import TrialState
+import pandas as pd
 import torch
 from torch.nn.utils import clip_grad_norm_
 
-from utils.data_utils import Manual, get_data_loaders, get_constraints, process_data
+wd_path = os.environ.get(
+    "PICO_SRC",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+sys.path.append(wd_path)
+
 from models.pico import iCoVAE
-
-import numpy as np
-import os
-import json
-import pandas as pd
-import shutil
-
-import optuna
-from optuna.trial import TrialState
-
-# import wandb
-# from wandb_osh.hooks import TriggerWandbSyncHook
+from utils.data_utils import Manual, get_constraints, get_data_loaders, process_data
 
 
 def main(trial, x, s, c, y, args, save_folder, hopt=True):
@@ -61,9 +81,6 @@ def main(trial, x, s, c, y, args, save_folder, hopt=True):
     trial.set_user_attr("constraints", args.curr_constraints)
     trial.set_user_attr("confounders", args.confounders)
 
-    # SET UP WANDB
-    # trigger_sync = TriggerWandbSyncHook()
-
     # Default filtering for top 1500 highest variance features in x
     dataset_params = {"var_filt_x": 1500, "var_filt_s": None}
 
@@ -100,10 +117,6 @@ def main(trial, x, s, c, y, args, save_folder, hopt=True):
                 )
                 return previous_trial.value
 
-    # In the case where we specify genes, we need to make sure we have enough zdims
-    # if len(args.constraints) > args.z_dim:
-    #    raise ValueError("Too many constraints specified for latent dimension. Increase z_dim or reduce number of constraints.")
-
     if hopt:
         cv_num = 5
         val_split = 1 / cv_num
@@ -117,18 +130,6 @@ def main(trial, x, s, c, y, args, save_folder, hopt=True):
     fold_best_epochs = []
 
     for curr_fold in range(cv_num):
-        # Start a new wandb run to track this script.
-        # run = wandb.init(name=f"{'_'.join(args.save_folder.split('/')[-3:])}_{curr_fold}_{'train' if hopt else 'test'}",
-        # Set the wandb entity where your project will be logged (generally your team name).
-        #    entity="nifnet",
-        # Set the wandb project where this run will be logged.
-        #    project="pico",
-        # Track hyperparameters and run metadata.
-        #   config=args,
-        #   mode="offline",
-        #   dir=args.save_folder,
-        # )
-
         if hopt:
             print(f"Fold {curr_fold}:")
         else:
@@ -148,7 +149,6 @@ def main(trial, x, s, c, y, args, save_folder, hopt=True):
 
         x_0, _, _, _, _, _ = dataset[0]
         input_dim = x_0.shape[0]
-        # print(f"input dim: {input_dim}")
 
         # .dataset.dataset accesses a Subset, then the original Dataset used to form the subset. This has the prior_fn_loc attribute
         icovae = iCoVAE(
@@ -323,11 +323,6 @@ def main(trial, x, s, c, y, args, save_folder, hopt=True):
                     }
                 )
 
-                # Wandb logging
-                # run.log(metric_dict_list[-1])
-                # if epoch % 10 == 0:
-                #   trigger_sync()
-
                 # Printing the epoch results in a neat table format
                 print(f"\n[Seed {args.seed} Fold {curr_fold} Epoch {epoch}]")
                 print(f"{'Metrics:':<30}")
@@ -383,11 +378,6 @@ def main(trial, x, s, c, y, args, save_folder, hopt=True):
                     }
                 )
 
-                # Wandb logging
-                # run.log(metric_dict_list[-1])
-                # if epoch % 10 == 0:
-                #    trigger_sync()
-
                 print(f"\n[Seed {args.seed} Epoch {epoch}]")
                 print(f"{'Metrics:':<30}")
                 print(f"{'-' * 50}")
@@ -411,9 +401,6 @@ def main(trial, x, s, c, y, args, save_folder, hopt=True):
             val_loss_report = losses_df_report["val_loss"].tolist()
             fold_min_losses.append(np.nanmin(val_loss_report))
             fold_best_epochs.append(best_epoch)
-
-            # trigger_sync()
-            # run.finish()
 
         else:
             # SAVE LOSSES FROM FOLD TO CSV
@@ -456,17 +443,6 @@ def main(trial, x, s, c, y, args, save_folder, hopt=True):
         )
         icovae.save_models(save_folder, seed=args.seed)
 
-        # # GENERATE PREDICTIONS FOR TEST SET USING FINAL MODEL
-        # with torch.no_grad():
-        #     if "test" in data_loaders.keys():
-        #         icovae.eval()
-        #         test_rmse, test_pearson, test_spearman = icovae.rmse(
-        #             data_loaders["test"], len(args.constraints), map_est=True, k=1
-        #         )
-        #         print(f"Test RMSE: {test_rmse}")
-        #         print(f"Test Pearson r: {test_pearson}")
-        #         print(f"Test Spearman r: {test_spearman}")
-
         # SAVE BEST ARGS
         with open(f"{save_folder}/args_best.txt", "w") as f:
             json.dump(args.__dict__, f, indent=2)
@@ -477,90 +453,126 @@ def parser_args(parser):
         "--cuda",
         default=False,
         action="store_true",
-        help="use GPU(s) to speed up training",
+        help="Use GPU(s) for training; requires a CUDA-enabled PyTorch install.",
     )
     parser.add_argument(
-        "-n", "--num-epochs", default=300, type=int, help="number of epochs to run"
+        "-n",
+        "--num-epochs",
+        default=300,
+        type=int,
+        help="Maximum number of training epochs per fold (--num-epochs / -n). Early stopping may terminate sooner.",
     )
     parser.add_argument(
         "-target",
         type=str,
         default="TAMOXIFEN",
         metavar="D",
-        help="Target column in y.",
+        help=(
+            "Target column in y (e.g. 'AFATINIB' for depmap_gdsc, "
+            "'RCB.score' for TransNEO treatment response)."
+        ),
     )
     parser.add_argument(
         "-dataset",
         type=str,
         default="depmap_gdsc",
         metavar="D",
-        help="Dataset name",
+        help=(
+            "Dataset name; see src/utils/data_utils.py:process_data for registered "
+            "options (e.g. 'depmap_gdsc', 'depmap_gdsc_transneo')."
+        ),
     )
     # Fixed seed for hopt
-    parser.add_argument("-seed", default=4563, type=int, help="Random seed")
+    parser.add_argument(
+        "-seed",
+        default=4563,
+        type=int,
+        help=(
+            "Random seed. Used both for the Optuna TPE sampler and for Python/NumPy/PyTorch "
+            "random number generation inside the model."
+        ),
+    )
     # Fixed arguments for hyperparameter optimisation -- use defaults
     parser.add_argument(
         "-constraints",
         default=None,
         type=str,
         nargs="+",
-        help="If specified, uses these constraints rather than using defaults or selecting automatically",
+        help=(
+            "If specified, uses these constraints rather than using defaults or "
+            "selecting automatically. Reserved keywords: 'breast_drivers', 'general', 'pca'."
+        ),
     )
     parser.add_argument(
         "--confounders",
         default=None,
         type=str,
         nargs="+",
-        help="Confounders used in final prediction model",
+        help="Confounders used in final prediction model.",
     )
     parser.add_argument(
         "-fc",
         "--fullyc",
         default=False,
         action="store_true",
-        help="Use fully connected regressor for constraints?",
+        help=(
+            "Use a fully connected regressor for the constraint head (--fullyc / -fc). "
+            "When set, the constraint regressor is an MLP rather than the default head."
+        ),
     )
     parser.add_argument(
         "-ld",
         "--lindec",
         default=False,
         action="store_true",
-        help="Use a linear decoder?",
+        help=(
+            "Use a linear decoder (--lindec / -ld). When set, the decoder is a single "
+            "linear layer rather than an MLP."
+        ),
     )
     parser.add_argument(
         "--experiment",
         default=None,
         type=str,
-        help="Which experiment to run (user defined in data loading)",
+        help=(
+            "User-defined experiment tag propagated into output paths "
+            "(e.g. 'h16' for 16 held-out cancer types, 'artemis_pbcp' for TransNEO external validation)."
+        ),
     )
     parser.add_argument(
         "--col-thresh",
         default=0.9,
         type=float,
-        help="Threshold for constraint collinearity filtering (only for depmap_gdsc)",
+        help="Threshold for constraint collinearity filtering (only for depmap_gdsc).",
     )
     parser.add_argument(
         "--newstudy",
         default=False,
         action="store_true",
-        help="Whether to always start a new study in optuna",
+        help=(
+            "Delete the existing Optuna SQLite study at the target save folder before "
+            "creating a fresh one. Use this when you've changed the hyperparameter search space."
+        ),
     )
     parser.add_argument(
         "--test",
         default=False,
         action="store_true",
-        help="Whether to train with recommended hyperparameters",
+        help=(
+            "Enqueue the single best trial from a prior AFATINIB hopt study (loaded from "
+            "the matching 'AFATINIB/<experiment>/icovae' folder) and run only that trial. "
+            "A shortcut for per-drug refitting once the AFATINIB hopt has been done."
+        ),
     )
     return parser
 
 
 if __name__ == "__main__":
+    # 1. Parse args and build save folder
     parser = argparse.ArgumentParser()
     parser = parser_args(parser)
     args = parser.parse_args()
 
-    # timestr = time.strftime("%Y%m%d_%H%M%S")
-    # TODO: Added  for different model version
     if args.experiment is not None:
         save_folder = f"{wd_path}/data/outputs/{args.dataset}/{args.target}/{args.experiment}/icovae"
     else:
@@ -581,6 +593,7 @@ if __name__ == "__main__":
     # Put save folder in args
     args.save_folder = save_folder
 
+    # 2. Load data and select constraints
     # PROCESS DATASET
     x, s, c, y, test_samples = process_data(
         dataset=args.dataset, wd_path=wd_path, experiment=args.experiment
@@ -653,6 +666,7 @@ if __name__ == "__main__":
     # iCoVAE stage
     args.stage = "i"
 
+    # 3. Build Optuna study
     # CREAT OPTUNA STUDY
     # If specified to start new study and the study already exists, delete the study
     if args.newstudy:
@@ -668,17 +682,6 @@ if __name__ == "__main__":
         url=f"sqlite:////{save_folder}/icovae_optuna.db",
         engine_kwargs={"connect_args": {"timeout": 1000}},
     )
-
-    # try:
-    # Try to copy study from old location
-    # optuna.copy_study(
-    # from_study_name="_".join(save_folder.split("/")[-3:]),
-    # from_storage=f"sqlite:////{'/'.join(save_folder.split('/')[:-3])}/icovae_optuna.db",
-    # to_storage=f"sqlite:////{save_folder}/icovae_optuna.db",
-    # )
-    # print("Copying Optuna study from old location...")
-    # except:
-    # print("No previous Optuna study found in old location...")
 
     study = optuna.create_study(
         sampler=optuna.samplers.TPESampler(
@@ -711,6 +714,7 @@ if __name__ == "__main__":
     else:
         n_trials = 150
 
+    # 4. Run hopt
     # HYPERPARAMETER OPTIMIZATION
     func = lambda trial: main(
         trial, x=x, s=s, c=c, y=y, args=args, save_folder=save_folder
@@ -727,6 +731,7 @@ if __name__ == "__main__":
     print(study_df.head(10))
     study_df.to_csv(f"{save_folder}/opt_study_results.csv")
 
+    # 5. Refit best trial for 10 seeds
     # REFIT MODEL USING BEST TRIAL
     args.num_epochs = int(np.round(study.best_trial.user_attrs["num_epochs"]))
     main(

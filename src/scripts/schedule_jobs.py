@@ -1,12 +1,40 @@
-import sys
+"""Generate and submit SLURM jobs for PiCoSK on the TransNEO / SCAN-B / TCGA cohorts.
 
-wd_path = "/home/dk538/rds/hpc-work/pico/src"
-sys.path.append(wd_path)
+This script writes a SLURM submission script for each combination of feature set,
+encoder ('VAE' or 'iCoVAE'), regressor (chosen by target type), and seed (4563),
+then submits each job via `sbatch`. Submitted jobs invoke
+src/scripts/pico_sk_hopt.py with the matching command-line arguments. Whether a
+job is submitted depends on the dataset:
 
-import os
-import time
+  - depmap_gdsc_transneo: feature sets Rep, Clinical+Rep, Clinical+Rep+RNA,
+    Clinical+RNA, RNA, Clinical; regressors selected by target
+    (RCB.score -> ElasticNet/SVR/RandomForestRegressor;
+     resp.pCR / BCFi_3Y / OS_3Y / BCFi_5Y -> LogisticRegression;
+     BCFi_MONTHS -> CoxPH).
+  - depmap_gdsc_scanb_tcga: feature sets Rep, Clinical+Rep, Clinical;
+    same regressor mapping plus optional CoxPH stratification.
+
+Inputs are command-line arguments listing the dataset, target, optional
+experiment tag, constraints, strata, walltime and a --newstudy resubmission
+flag. Outputs are SLURM scripts written to <wd_path>/submissions/ and the
+queued jobs themselves; if a target output already contains
+test_metrics_s<seed>.csv the job is skipped unless --newstudy is passed.
+
+Example:
+    python src/scripts/schedule_jobs.py -dataset depmap_gdsc_transneo \\
+        -target RCB.score --experiment artemis_pbcp -walltime 12:00:00
+"""
 
 import argparse
+import os
+import sys
+import time
+
+wd_path = os.environ.get(
+    "PICO_SRC",
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+)
+sys.path.append(wd_path)
 
 feat_sets_dict_transneo = {
     "Rep": "",
@@ -39,14 +67,14 @@ def submission_pico_sk_transneo(
         constraints_str = " ".join(constraints)
 
     submission_preamble = rf"""#!/bin/bash
-#SBATCH -J dk538-ssvae
-#SBATCH -A MRC-BSU2-SL2-CPU
+#SBATCH -J pico_hopt                # EDIT: pick a job name
+#SBATCH -A <your-slurm-account>     # EDIT: replace with your project/account
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time={walltime}
 #SBATCH --mail-type=end
-#SBATCH --mail-user=dom.kirkham@mrc-bsu.cam.ac.uk
-#SBATCH --output=/home/dk538/rds/hpc-work/graphdep/slurm_out/pico_hopt/%j.out
+#SBATCH --mail-user=<your-email>    # EDIT: notification address (or remove these --mail-* lines)
+#SBATCH --output=slurm_out/pico_hopt/%j.out   # EDIT: log output path
 #SBATCH --no-requeue
 #SBATCH -p icelake
 
@@ -60,9 +88,9 @@ module purge                               # Removes all modules still loaded
 module load rhel8/default-icl              # REQUIRED - loads the basic environment
 
 #! Insert additional module load commands after this line if needed:
-source /home/dk538/.bashrc
+source ~/.bashrc
 module load hdf5/1.8.2
-conda activate slurm-torch-2
+conda activate pico                 # EDIT: name of the conda env where pico is installed
 
 application="python -u ./scripts/pico_sk_hopt.py"
 
@@ -102,9 +130,6 @@ eval $CMD"""
         script_args = rf"""{script_args} --experiment {experiment}"""
     if feat_sets in ["Clinical", "Clinical+RNA", "RNA"]:
         script_args = rf"""{script_args} --norep"""
-    # Don't run on GPU
-    # else:
-    # script_args = fr'''{script_args} --cuda'''
     script_args = rf'''{script_args}"'''
 
     submission = rf"""{submission_preamble}
@@ -130,14 +155,14 @@ def submission_pico_sk_scanb(
         constraints_str = " ".join(constraints)
 
     submission_preamble = rf"""#!/bin/bash
-#SBATCH -J dk538-ssvae
-#SBATCH -A MRC-BSU2-SL2-CPU
+#SBATCH -J pico_hopt                # EDIT: pick a job name
+#SBATCH -A <your-slurm-account>     # EDIT: replace with your project/account
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time={walltime}
 #SBATCH --mail-type=end
-#SBATCH --mail-user=dom.kirkham@mrc-bsu.cam.ac.uk
-#SBATCH --output=/home/dk538/rds/hpc-work/graphdep/slurm_out/pico_hopt/%j.out
+#SBATCH --mail-user=<your-email>    # EDIT: notification address (or remove these --mail-* lines)
+#SBATCH --output=slurm_out/pico_hopt/%j.out   # EDIT: log output path
 #SBATCH --no-requeue
 #SBATCH -p icelake-himem
 #SBATCH --mem=13500
@@ -152,9 +177,9 @@ module purge                               # Removes all modules still loaded
 module load rhel8/default-icl              # REQUIRED - loads the basic environment
 
 #! Insert additional module load commands after this line if needed:
-source /home/dk538/.bashrc
+source ~/.bashrc
 module load hdf5/1.8.2
-conda activate slurm-torch-2
+conda activate pico                 # EDIT: name of the conda env where pico is installed
 
 application="python -u ./scripts/pico_sk_hopt.py"
 
@@ -198,9 +223,6 @@ eval $CMD"""
         script_args = rf"""{script_args} --experiment {experiment}"""
     if feat_sets in ["Clinical"]:
         script_args = rf"""{script_args} --norep"""
-    # Don't run on GPU
-    # else:
-    # script_args = fr'''{script_args} --cuda'''
     script_args = rf'''{script_args}"'''
 
     submission = rf"""{submission_preamble}
@@ -297,7 +319,7 @@ def main(args):
 
 # To cancel these jobs, run the below
 # squeue --me --states=ALL --Format=jobid,name --noheader |
-#   grep dk538-ssvae |
+#   grep <your-job-name> |
 #   awk '{print $1}' |
 #   xargs scancel
 
@@ -308,27 +330,41 @@ def parser_args(parser):
         type=str,
         default="ABCD",
         metavar="D",
-        help="Target column from y",
+        help=(
+            "Target column in y. Determines the regressor list "
+            "(e.g. 'RCB.score' -> ElasticNet/SVR/RandomForestRegressor, "
+            "'resp.pCR'/'BCFi_3Y'/'OS_3Y'/'BCFi_5Y' -> LogisticRegression, "
+            "'BCFi_MONTHS' -> CoxPH)."
+        ),
     )
     parser.add_argument(
         "-dataset",
         type=str,
         default="depmap_gdsc",
         metavar="S",
-        help="Dataset name (e.g. depmap_gdsc)",
+        help=(
+            "Dataset name; the dataset selects the available feature sets "
+            "(e.g. 'depmap_gdsc_transneo', 'depmap_gdsc_scanb_tcga')."
+        ),
     )
     parser.add_argument(
         "--experiment",
         default=None,
         type=str,
-        help="Experiment to run (user defined in data loading class)",
+        help=(
+            "User-defined experiment tag propagated into output paths "
+            "(e.g. 'h16' for 16 held-out cancer types, 'artemis_pbcp' for TransNEO external validation)."
+        ),
     )
     parser.add_argument(
         "-constraints",
         default=None,
         type=str,
         nargs="+",
-        help="If specified, uses encoder with these constraints rather than using defaults/selecting automatically",
+        help=(
+            "If specified, uses encoder with these constraints rather than using "
+            "defaults/selecting automatically."
+        ),
     )
     parser.add_argument(
         "-strata",
@@ -341,21 +377,23 @@ def parser_args(parser):
         "-walltime",
         default="12:00:00",
         type=str,
-        help="Walltime per job",
+        help="Walltime per job in HH:MM:SS format.",
     )
     parser.add_argument(
         "--newstudy",
         default=False,
         action="store_true",
-        help="If specified, resubmits all jobs regardless of previous completion",
+        help="If specified, resubmits all jobs regardless of previous completion.",
     )
 
     return parser
 
 
 if __name__ == "__main__":
+    # 1. Parse args
     parser = argparse.ArgumentParser()
     parser = parser_args(parser)
     args = parser.parse_args()
 
+    # 2. Submit jobs
     main(args)
