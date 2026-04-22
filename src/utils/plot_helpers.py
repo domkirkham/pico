@@ -448,11 +448,13 @@ def live_permutation_fi(
 
     base_pred = z_test_scaled @ coeffs + intercept
     if classification:
+        # sigmoid → P(class 1); pos_label=1 in the literal AUROC, matching
+        # ``utils.comp_utils.calculate_feat_imps`` exactly. Permutation-FI
+        # rankings depend on the *signed* drop in AUROC, so the max(auroc,
+        # 1-auroc) trick used elsewhere in plot_helpers must NOT be applied
+        # here — it would clip perm_auroc into the wrong half-plane.
         base_pred = 1.0 / (1.0 + np.exp(-base_pred))
-        base_auroc = max(
-            roc_auc_score(y_test, base_pred),
-            roc_auc_score(y_test, -base_pred),
-        )
+        base_auroc = roc_auc_score(y_test, base_pred)
     else:
         nas = np.isnan(y_test) | np.isnan(base_pred)
         base_r = pearsonr(base_pred[~nas], y_test[~nas])[0]
@@ -469,10 +471,7 @@ def live_permutation_fi(
             pred = z_perm @ coeffs + intercept
             if classification:
                 pred = 1.0 / (1.0 + np.exp(-pred))
-                auroc = max(
-                    roc_auc_score(y_test, pred),
-                    roc_auc_score(y_test, -pred),
-                )
+                auroc = roc_auc_score(y_test, pred)
                 records.append({"dim": col_name, "auroc_perm": auroc,
                                 "auroc": base_auroc, "seed": seed, "iter": it})
             else:

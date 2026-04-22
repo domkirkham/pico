@@ -87,18 +87,18 @@ Install dependencies:
 
 ## 3. Demo
 
-Two self-contained Jupyter notebooks reproduce the headline figures of the paper end-to-end on CPU. The pretrained iCoVAE / VAE encoders and a small preprocessed slice of DepMap / GDSC / TransNEO are included directly in this repository under [demo/assets/](demo/assets/) (~460 MB total), so no external downloads are required. The notebooks call the **paper's exact plotting code** (extracted into [demo/plot_helpers.py](demo/plot_helpers.py) from `results_analysis/*.ipynb` cells 39, 42, 43, 54), with the same Source Sans 3 typography as the published figures.
+Two self-contained Jupyter notebooks reproduce the headline figures of the paper end-to-end on CPU. The pretrained iCoVAE / VAE encoders and a small preprocessed slice of DepMap / GDSC / TransNEO are included directly in this repository under [demo/assets/](demo/assets/) (~420 MB total), so no external downloads are required. The notebooks call the paper's exact plotting code (extracted into [src/utils/plot_helpers.py](src/utils/plot_helpers.py).
 
 | Notebook | Open | Reproduces | Expected runtime (CPU) |
 | --- | --- | --- | --- |
-| [demo/demo_ccl.ipynb](demo/demo_ccl.ipynb) | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/domkirkham/pico/blob/main/demo/demo_ccl.ipynb) | **Fig. 3** (drug-response performance, both the aggregated boxplot and the per-drug pointplot) and **Fig. 4** (permutation feature importance) for four headline drugs: AZD6738, trametinib, oxaliplatin, 5-fluorouracil | ~3 min |
-| [demo/demo_transneo.ipynb](demo/demo_transneo.ipynb) | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/domkirkham/pico/blob/main/demo/demo_transneo.ipynb) | **Fig. 5c** (RCB regression two-panel CV + ARTemis+PBCP pointplot across all six paper feature sets), **Fig. 5d** (pCR classification, same shape), and the Clinical+z+RNA permutation feature importance panels | ~2 min |
+| [demo/demo_ccl.ipynb](demo/demo_ccl.ipynb) | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/domkirkham/pico/blob/main/demo/demo_ccl.ipynb) | **Fig. 3** (drug-response performance, both the aggregated boxplot and the per-drug pointplot) and **Fig. 4** (permutation feature importance) for four headline drugs: AZD6738, trametinib, oxaliplatin, 5-fluorouracil | ~5 min |
+| [demo/demo_transneo.ipynb](demo/demo_transneo.ipynb) | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/domkirkham/pico/blob/main/demo/demo_transneo.ipynb) | **Fig. 5c** (RCB regression two-panel CV + ARTemis+PBCP pointplot across all six paper feature sets), **Fig. 5d** (pCR classification, same shape), and the Clinical+z+RNA permutation feature importance panels | ~3 min |
 
-The CCL notebook also includes a **live-encoding reproducibility check** that loads each iCoVAE / VAE encoder, re-encodes gene expression on CPU, refits the standardiser + ElasticNet prediction head with the saved per-seed hyperparameters, and confirms bit-identity (max abs diff ≈ 1e-6) against the cached `z_pred_test_s{seed}.csv` files used to make the paper's figures.
+Both notebooks focus on modelling: they forward-pass each iCoVAE / VAE encoder live on the bundled gene-expression matrices, refit the Stage-2 ElasticNet / LogisticRegression probe with the saved per-seed hyperparameters, score on the held-out cancer types (CCL) or the ARTemis+PBCP cohort (TransNEO), and compute permutation feature importance from the fitted regressor coefficients. Per-seed test metrics are identical to the cached values from the original training pipeline — no precomputed predictions are loaded from disk.
 
 ### Running the demo on Google Colab (recommended)
 
-Click either Colab badge at the top of this README. Each notebook starts with a `pip install` cell that sets up the environment; subsequent cells clone the repo, load the included pretrained encoders and preprocessed data, run the live-encoding reproducibility check (CCL only), aggregate metrics via the paper's performance-comparison utility (`PerfComp.calculate_perf` in `src/utils/comp_utils.py`), then plot via `demo/plot_helpers.py`.
+Click either Colab badge at the top of this README. The notebook's first cell clones the repo and pins a torch version that's compatible with the current Colab runtime; subsequent cells load the included pretrained encoders + preprocessed data, run the live encoding + Stage-2 fit, then plot via `src/utils/plot_helpers.py`.
 
 ### Running the demo locally
 
@@ -121,7 +121,7 @@ Each notebook prints aggregated metric tables and saves figures (PNG + SVG, dpi 
   | Oxaliplatin | **0.55 ± 0.001** | 0.46 ± 0.03 |
   | 5-Fluorouracil | **0.32 ± 0.01** | 0.24 ± 0.05 |
 
-  Plus a permutation-feature-importance bar plot per drug (Fig. 4b–e), labelled by constraint gene (e.g. z_ITGB5, z_RAD17 for AZD6738; z_MDM4, z_TTF2 for oxaliplatin).
+  Plus a permutation-feature-importance bar plot per drug (Fig. 4b–e). The first 16 latent dims are labelled by their constraint gene (e.g. z_RAD17, z_HUS1 for AZD6738; z_MDM4, z_TTF2 for oxaliplatin); the remaining unconstrained dims appear as z_16, z_17, …
 
 * **`demo_transneo.ipynb`** — RCB Spearman correlation and pCR AUROC on the ARTemis+PBCP external validation cohort, across all six paper feature sets. Expected numbers (matching Fig. 5c,d):
 
@@ -130,7 +130,7 @@ Each notebook prints aggregated metric tables and saves figures (PNG + SVG, dpi 
   | RCB Spearman ρ | ~0.76 | ~0.74 | ~0.78 | ~0.59 |
   | pCR AUROC | ~0.91 | ~0.89 | ~0.89 | ~0.74 |
 
-  Plus permutation-feature-importance panels for the Clinical+z+RNA model showing z_TP53 / *ESR1* expression / taxane score for RCB and z_ERBB2 / age / *PGR* expression for pCR.
+  Plus permutation-feature-importance panels for the Clinical+z+RNA model. The pCR panel is dominated by z_ERBB2, *PGR* expression, and age; the RCB panel by *ESR1* / *PGR* expression and the constrained z dimensions tied to therapy-relevant genes (taxane score, z_PSMC1, z_FANCF).
 
 ### What's included
 
@@ -206,13 +206,12 @@ The data and pretrained encoders included under [demo/assets/](demo/assets/) are
 | Path | Description |
 | --- | --- |
 | [demo/](demo/) | Two Colab/local demo notebooks (`demo_ccl.ipynb`, `demo_transneo.ipynb`) plus the pretrained encoders and small preprocessed data they read from `assets/` |
-| [demo/plot_helpers.py](demo/plot_helpers.py) | Shared module of plotting + loading functions, lifted near-verbatim from the paper analysis notebooks (cells 39, 42, 43, 54) |
 | [results_analysis/](results_analysis/) | Notebooks used to produce the figures in the paper |
 | [src/](src/) | Core PiCo package (see [src/README.md](src/README.md) for a directory map) |
 | [src/models/](src/models/) | `iCoVAE` and `PiCo` model classes |
 | [src/scripts/](src/scripts/) | Training / hyperparameter-optimisation entry points |
 | [scripts/](scripts/) | Demo-build utilities (`build_demo_bundle.py`, `build_demo_notebooks.py`) |
-| [src/utils/](src/utils/) | Data-loading and comparison utilities (`PerfComp`, `calculate_feat_imps`, etc.) |
+| [src/utils/](src/utils/) | Data-loading and comparison utilities (`PerfComp`, `calculate_feat_imps`, `plot_helpers`) |
 | [docs/examples/slurm/](docs/examples/slurm/) | Example SLURM submission templates for full training runs on a Cambridge CSD3 Wilkes3-style cluster |
 | [MODEL_CARD.md](MODEL_CARD.md) | Model card (intended use, training data, evaluation, limitations, environmental impact) |
 
